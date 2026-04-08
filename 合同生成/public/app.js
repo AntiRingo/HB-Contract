@@ -6,6 +6,7 @@ const templateInfoEl = document.getElementById("templateInfo");
 const purchaseInfoEl = document.getElementById("purchaseInfo");
 const mergeBtnEl = document.getElementById("mergeBtn");
 const downloadBtnEl = document.getElementById("downloadBtn");
+const saveBtnEl = document.getElementById("saveBtn");
 const statusEl = document.getElementById("status");
 const previewEl = document.getElementById("preview");
 
@@ -34,6 +35,34 @@ function buildApiUrl(pathname) {
   const base = getApiBase();
   if (!base) return pathname;
   return `${base}${pathname}`;
+}
+
+async function postBinaryWithFallback(pathname, buffer, contentType = "application/octet-stream") {
+  const primary = buildApiUrl(pathname);
+  try {
+    const res = await fetch(primary, {
+      method: "POST",
+      headers: { "Content-Type": contentType },
+      body: buffer,
+    });
+    if (res.ok && !isHtmlLikeResponse(res)) return res;
+    if (shouldTryLocalApiFallback()) {
+      const fb = await fetch(`http://localhost:3000${pathname}`, {
+        method: "POST",
+        headers: { "Content-Type": contentType },
+        body: buffer,
+      });
+      return fb;
+    }
+    return res;
+  } catch (e) {
+    if (!shouldTryLocalApiFallback()) throw e;
+    return await fetch(`http://localhost:3000${pathname}`, {
+      method: "POST",
+      headers: { "Content-Type": contentType },
+      body: buffer,
+    });
+  }
 }
 
 function shouldTryLocalApiFallback() {
@@ -1229,6 +1258,7 @@ async function mergeToNewWorkbook() {
   }
 
   downloadBtnEl.disabled = false;
+  if (saveBtnEl) saveBtnEl.disabled = false;
   renderPreview(templateClone, templateSheetName);
   setStatus(
     `已插入 ${result.insertedRows} 行（插入起始行：第 ${result.headerRowIndex + 2} 行；标题匹配 ${result.matchedHeaders}/${result.purchaseHeaderCount}）`,
@@ -1245,6 +1275,33 @@ async function handleDownload() {
   await downloadWorkbook(state.merged, filename);
 }
 
+async function handleSaveToServer() {
+  if (!state.merged) return;
+  const templateNameRaw = state.template?.file?.name?.replace(/\.(xlsx|xls)$/i, "") || "合同模板";
+  const templateName = sanitizeFilenamePart(templateNameRaw) || "合同模板";
+  const purchaseNoRaw = getPurchaseOrderNoFromTemplate(state.merged, state.mergedSheetName);
+  const purchaseNo = sanitizeFilenamePart(purchaseNoRaw);
+  const baseName = purchaseNo ? `${templateName}_${purchaseNo}` : `${templateName}_已插入订购单`;
+
+  try {
+    setStatus("正在保存到服务器…");
+    const out = await state.merged.xlsx.writeBuffer();
+    const pathname = `/api/contracts/save?name=${encodeURIComponent(baseName)}`;
+    const res = await postBinaryWithFallback(pathname, out);
+    let json = null;
+    try {
+      json = await res.json();
+    } catch {}
+    if (!res.ok || !json?.success) {
+      const msg = json?.error || `${res.status} ${res.statusText}`;
+      throw new Error(msg);
+    }
+    setStatus("已保存到合同列表");
+  } catch (e) {
+    setStatus(`保存失败：${e?.message ?? e}`);
+  }
+}
+
 templateSelectEl.addEventListener("change", handleTemplateSelectChange);
 if (purchaseSelectEl) purchaseSelectEl.addEventListener("change", handlePurchaseSelectChange);
 mergeBtnEl.addEventListener("click", () => {
@@ -1256,12 +1313,14 @@ mergeBtnEl.addEventListener("click", () => {
   });
 });
 downloadBtnEl.addEventListener("click", handleDownload);
+if (saveBtnEl) saveBtnEl.addEventListener("click", handleSaveToServer);
 
 templateSheetEl.addEventListener("change", async () => {
   if (!state.template?.workbook) return;
   state.merged = state.template.workbook;
   state.mergedSheetName = templateSheetEl.value;
   downloadBtnEl.disabled = true;
+  if (saveBtnEl) saveBtnEl.disabled = true;
   setStatus("");
   
   try {
@@ -1276,6 +1335,7 @@ purchaseSheetEl.addEventListener("change", () => {
   state.merged = state.template?.workbook || null;
   state.mergedSheetName = templateSheetEl.value;
   downloadBtnEl.disabled = true;
+  if (saveBtnEl) saveBtnEl.disabled = true;
   setStatus("");
   
   if (state.merged && state.mergedSheetName) {

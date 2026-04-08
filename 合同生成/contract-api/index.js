@@ -24,6 +24,9 @@ app.use('/api/templates', templatesRouter);
 const purchaseOrdersRouter = require('./routes/purchase-orders');
 app.use('/api/purchase-orders', purchaseOrdersRouter);
 
+const contractsRouter = require('./routes/contracts');
+app.use('/api/contracts', contractsRouter);
+
 // 对于所有其他未匹配的请求，返回 index.html（支持前端路由）
 app.get(/.*/, (req, res) => {
     res.sendFile(path.join(__dirname, '../public/index.html'));
