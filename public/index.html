@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>合同模板插入订购单</title>                
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hyperformula/dist/hyperformula.full.min.js"></script>
+  </head>
+  <body>
+    <div class="page">
+      <header class="header">
+        <h1 class="title">合同模板插入订购单</h1>
+        <p class="subtitle">
+          选择“合同模板”和“订购单”，按订购单首行标题在合同模板中定位同名标题行，将订购内容插入其下方。
+        </p>
+      </header>
+
+      <section class="panel">
+        <div class="grid">
+          <div class="card">
+            <div class="cardTitle">1) 合同模板（数据库选择）</div>
+            <div class="row">
+              <label class="label" for="templateSelect">选择模板：</label>
+              <select id="templateSelect" class="select">
+                <option value="">正在加载模板...</option>
+              </select>
+            </div>
+            <div class="row">
+              <label class="label" for="templateSheet">工作表：</label>
+              <select id="templateSheet" class="select" disabled></select>
+            </div>
+            <div id="templateInfo" class="meta"></div>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">2) 订购单（数据库选择）</div>
+            <div class="row">
+              <label class="label" for="purchaseSelect">选择订购单：</label>
+              <select id="purchaseSelect" class="select">
+                <option value="">正在加载订购单...</option>
+              </select>
+            </div>
+            <div class="row">
+              <label class="label" for="purchaseSheet">工作表：</label>
+              <select id="purchaseSheet" class="select" disabled></select>
+            </div>
+            <div id="purchaseInfo" class="meta"></div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="mergeBtn" class="btn primary" disabled>生成并预览</button>
+          <button id="downloadBtn" class="btn" disabled>下载修改后文件</button>
+          <span id="status" class="status"></span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panelTitle">预览</div>
+        <div class="previewHint">
+          <span>可在此直接修改模板或生成后的内容。预览仅展示前 60 行与前 20 列。</span>
+          <span class="editBadge">支持点击单元格直接修改内容</span>
+        </div>
+        <div id="preview" class="preview"></div>
+      </section>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
