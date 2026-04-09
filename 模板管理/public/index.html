@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>模板管理</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="header">
+        <div>
+          <h1 class="title">模板管理</h1>
+          <p class="subtitle">上传文件到合同数据库：公司合同模板、采购单</p>
+        </div>
+        <nav class="nav">
+          <a class="link" href="/">刷新</a>
+        </nav>
+      </header>
+
+      <section class="panel">
+        <div class="grid">
+          <div class="card">
+            <div class="cardTitle">1) 公司合同模板（上传到数据库）</div>
+            <div class="row">
+              <label class="label" for="templateName">名称：</label>
+              <input id="templateName" class="input" placeholder="例如：标准采购合同" />
+            </div>
+            <div class="row">
+              <label class="label" for="templateFile">文件：</label>
+              <input id="templateFile" class="file" type="file" />
+            </div>
+            <div class="actions">
+              <button id="uploadTemplateBtn" class="btn primary">上传模板</button>
+              <span id="templateStatus" class="status"></span>
+            </div>
+            <div class="meta">支持 xlsx/xls/docx/pdf 等文件；上传后会写入数据库并保留一份本地备份。</div>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">2) 采购单（上传到数据库）</div>
+            <div class="row">
+              <label class="label" for="purchaseName">名称：</label>
+              <input id="purchaseName" class="input" placeholder="例如：HB20260328-001" />
+            </div>
+            <div class="row">
+              <label class="label" for="purchaseFile">文件：</label>
+              <input id="purchaseFile" class="file" type="file" />
+            </div>
+            <div class="actions">
+              <button id="uploadPurchaseBtn" class="btn primary">上传采购单</button>
+              <span id="purchaseStatus" class="status"></span>
+            </div>
+            <div class="meta">采购单表通常仅保存文件路径；上传会保存文件到本地并写入数据库。</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panelTitle">已上传 - 公司合同模板</div>
+        <div class="tableWrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th style="width: 70px">ID</th>
+                <th>名称</th>
+                <th style="width: 120px">类型</th>
+                <th style="width: 190px">创建时间</th>
+                <th style="width: 250px">操作</th>
+              </tr>
+            </thead>
+            <tbody id="templatesTbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panelTitle">已上传 - 采购单</div>
+        <div class="tableWrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th style="width: 70px">ID</th>
+                <th>名称</th>
+                <th>文件路径</th>
+                <th style="width: 250px">操作</th>
+              </tr>
+            </thead>
+            <tbody id="purchaseTbody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <div id="previewOverlay" class="overlay hidden" role="dialog" aria-modal="true">
+      <div class="modal">
+        <div class="modalHeader">
+          <div>
+            <div id="previewTitle" class="modalTitle">预览</div>
+            <div id="previewMeta" class="modalMeta"></div>
+          </div>
+          <button id="previewClose" class="btn">关闭</button>
+        </div>
+        <div id="previewBody" class="modalBody"></div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
