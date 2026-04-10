@@ -196,13 +196,14 @@ async function refreshTemplates() {
     return;
   }
   tbody.innerHTML = data
-    .map((r) => {
+    .map((r, idx) => {
       const id = escapeHtml(r.id);
       const name = escapeHtml(r.name || r.file_name || '');
       const type = escapeHtml(r.file_type);
       const created = escapeHtml(formatDate(r.created_at));
+      const displayId = escapeHtml(idx + 1);
       return `<tr>
-        <td>${id}</td>
+        <td>${displayId}</td>
         <td title="${name}">${name}</td>
         <td>${type}</td>
         <td>${created}</td>
@@ -227,12 +228,13 @@ async function refreshPurchaseOrders() {
     return;
   }
   tbody.innerHTML = data
-    .map((r) => {
+    .map((r, idx) => {
       const id = escapeHtml(r.id);
       const name = escapeHtml(r.name || '');
       const filePath = escapeHtml(r.file_path);
+      const displayId = escapeHtml(idx + 1);
       return `<tr>
-        <td>${id}</td>
+        <td>${displayId}</td>
         <td title="${name}">${name}</td>
         <td title="${filePath}">${filePath}</td>
         <td class="opCell">
