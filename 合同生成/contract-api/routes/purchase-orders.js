@@ -42,7 +42,7 @@ function resolveAbsoluteFilePath(filePathValue) {
     return path.join(__dirname, '../../', normalized);
 }
 
-const table = '采购单';
+const table = '采购单列表';
 const columns = { id: 'Id', name: 'Name', filePath: 'File_path' };
 
 router.get('/', async (req, res) => {

@@ -94,7 +94,7 @@ async function resolvePurchaseOrdersConfig() {
       .map((t) => String(t));
 
     const table =
-      tableNames.find((t) => t === '采购单') ||
+      tableNames.find((t) => t === '采购单列表') ||
       tableNames.find((t) => t.includes('采购')) ||
       tableNames.find((t) => t.toLowerCase().includes('purchase')) ||
       null;
@@ -102,7 +102,7 @@ async function resolvePurchaseOrdersConfig() {
     if (!table) {
       throw new Error('未找到采购单表');
     }
-
+                 
     const [descRows] = await pool.query(`DESCRIBE ${quoteIdent(table)}`);
     const fields = descRows.map((r) => r.Field);
 
@@ -165,7 +165,8 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const { table, columns } = config;
 
     const originalName = safeBasename(normalizeIncomingFilename(file.originalname));
-    const name = String(req.body?.name ?? '').trim() || originalName;
+    const originalBaseName = path.parse(originalName).name || originalName;
+    const name = String(req.body?.name ?? '').trim() || originalBaseName;
     const relativePath = path.join('uploads', 'purchase-orders', file.filename).replace(/\\/g, '/');
 
     const [result] = await pool.query(

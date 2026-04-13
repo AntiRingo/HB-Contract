@@ -29,7 +29,7 @@ async function resolveTemplatesConfig() {
 
         const table =
             tableNames.find((t) => t.toLowerCase() === 'contract_templates') ||
-            tableNames.find((t) => t === '公司合同模板') ||
+            tableNames.find((t) => t === '合同模板列表') ||
             tableNames.find((t) => t.includes('模板')) ||
             null;
 

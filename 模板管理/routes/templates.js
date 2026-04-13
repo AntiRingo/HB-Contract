@@ -90,7 +90,7 @@ function resolveAbsFilePath(filePathValue) {
     if (fs.existsSync(p)) return p;
   }
   return null;
-}
+}   
 
 let templatesConfigPromise = null;
 async function resolveTemplatesConfig() {
@@ -104,7 +104,7 @@ async function resolveTemplatesConfig() {
 
     const table =
       tableNames.find((t) => t.toLowerCase() === 'contract_templates') ||
-      tableNames.find((t) => t === '公司合同模板') ||
+      tableNames.find((t) => t === '合同模板列表') ||
       tableNames.find((t) => t.includes('合同模板')) ||
       tableNames.find((t) => t.includes('模板')) ||
       null;
@@ -214,7 +214,8 @@ router.post('/upload', upload.single('file'), async (req, res) => {
 
     const originalName = safeBasename(normalizeIncomingFilename(file.originalname));
     const ext = path.extname(originalName).replace(/^\./, '').toLowerCase() || 'bin';
-    const name = String(req.body?.name ?? '').trim() || originalName;
+    const originalBaseName = path.parse(originalName).name || originalName;
+    const name = String(req.body?.name ?? '').trim() || originalBaseName;
 
     const uploadsDir = path.join(__dirname, '..', 'uploads', 'templates');
     fs.mkdirSync(uploadsDir, { recursive: true });

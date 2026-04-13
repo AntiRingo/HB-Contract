@@ -54,6 +54,13 @@ function extFromName(name) {
   return m ? String(m[1]).toLowerCase() : '';
 }
 
+function stripFileExtension(filename) {
+  const s = String(filename ?? '');
+  const i = s.lastIndexOf('.');
+  if (i > 0) return s.slice(0, i);
+  return s;
+}
+
 function normalizeType(typeOrExt) {
   const t = String(typeOrExt ?? '').trim().toLowerCase();
   if (!t) return '';
@@ -115,6 +122,10 @@ async function renderExcelPreview(arrayBuffer) {
 
   const cellToString = (cell) => {
     if (!cell) return '';
+    if (cell.isMerged) {
+      const master = cell.master;
+      if (master && master.address && cell.address && master.address !== cell.address) return '';
+    }
     const v = cell.value;
     if (v == null) return '';
     if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
@@ -313,14 +324,14 @@ async function init() {
     const fileInput = $('templateFile');
     const file = fileInput.files && fileInput.files[0];
     if (!file) return;
-    if (!String(input.value || '').trim()) input.value = file.name;
+    if (!String(input.value || '').trim()) input.value = stripFileExtension(file.name);
   });
   $('purchaseFile').addEventListener('change', () => {
     const input = $('purchaseName');
     const fileInput = $('purchaseFile');
     const file = fileInput.files && fileInput.files[0];
     if (!file) return;
-    if (!String(input.value || '').trim()) input.value = file.name;
+    if (!String(input.value || '').trim()) input.value = stripFileExtension(file.name);
   });
 
   $('templatesTbody').addEventListener('click', async (e) => {
