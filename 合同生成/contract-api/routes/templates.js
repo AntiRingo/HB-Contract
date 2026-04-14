@@ -4,6 +4,9 @@ const path = require('path');
 const fs = require('fs');
 const pool = require('../db');
 
+const projectRootDir = path.resolve(__dirname, '../..');
+const templateStorageDir = path.resolve(projectRootDir, '../数据库/合同模板列表');
+
 function quoteIdent(ident) {
     return `\`${String(ident).replace(/`/g, '``')}\``;
 }
@@ -156,6 +159,26 @@ function appendExtIfMissing(name, fileType) {
     return `${base}.bin`;
 }
 
+function resolveAbsoluteFilePath(filePathValue) {
+    const raw = String(filePathValue ?? '').trim();
+    if (!raw) return null;
+    if (/^https?:\/\//i.test(raw)) return null;
+    if (path.isAbsolute(raw)) return raw;
+
+    const normalized = raw.replace(/^[/\\]+/, '');
+    const baseName = path.basename(normalized);
+    const candidates = [
+        path.resolve(templateStorageDir, normalized),
+        path.resolve(templateStorageDir, baseName),
+        path.resolve(projectRootDir, normalized),
+        path.resolve(projectRootDir, baseName),
+    ];
+    for (const p of candidates) {
+        if (fs.existsSync(p)) return p;
+    }
+    return candidates[0] ?? null;
+}
+
 // ========== 1. 获取所有模板列表 ==========
 router.get('/', async (req, res) => {
     try {
@@ -270,7 +293,10 @@ router.get('/:id/download', async (req, res) => {
             return res.status(500).json({ success: false, error: '模板文件数据缺失' });
         }
 
-        const absolutePath = path.join(__dirname, '../../', filePath);
+        const absolutePath = resolveAbsoluteFilePath(filePath);
+        if (!absolutePath) {
+            return res.status(500).json({ success: false, error: '模板文件地址无效' });
+        }
         if (!fs.existsSync(absolutePath)) {
             return res.status(404).json({ success: false, error: '文件不存在' });
         }

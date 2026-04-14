@@ -24,6 +24,25 @@ function safeBasename(filename) {
   return base.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_').slice(0, 180) || 'file';
 }
 
+function safeBaseName(name) {
+  const s = String(name ?? '').trim();
+  const base = s.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_').replace(/\s+/g, ' ');
+  return base.slice(0, 180).trim();
+}
+
+function buildUniqueFilename(dir, baseName, ext) {
+  const base = safeBaseName(baseName) || 'file';
+  const cleanExt = String(ext ?? '').replace(/^\./, '').trim().toLowerCase() || 'bin';
+  const tryPath = (n) =>
+    path.join(dir, n === 0 ? `${base}.${cleanExt}` : `${base}_${n}.${cleanExt}`);
+
+  for (let n = 0; n < 1000; n++) {
+    const p = tryPath(n);
+    if (!fs.existsSync(p)) return { filename: path.basename(p), absPath: p };
+  }
+  throw new Error('无法生成唯一文件名');
+}
+
 function scoreFilename(str) {
   const s = String(str ?? '');
   const cjk = (s.match(/[\u4E00-\u9FFF]/g) || []).length;
@@ -75,12 +94,47 @@ function resolveAbsFilePath(filePathValue) {
   const normalized = raw.replace(/^[/\\]+/, '');
   const candidates = [
     path.join(__dirname, '..', normalized),
+    path.join(__dirname, '..', '..', normalized),
     path.join(__dirname, '..', '..', '合同生成', normalized)
   ];
   for (const p of candidates) {
     if (fs.existsSync(p)) return p;
   }
   return null;
+}
+
+function tryEnsureDbJunction() {
+  const link = path.resolve(__dirname, '..', '数据库');
+  const target = path.resolve(__dirname, '..', '..', '数据库');
+  try {
+    if (!fs.existsSync(link) && fs.existsSync(target)) {
+      fs.symlinkSync(target, link, 'junction');
+    }
+  } catch {}
+}
+
+function pickWritableDir(candidates) {
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const probe = path.join(
+        dir,
+        `.write_probe_${process.pid}_${Date.now()}_${Math.random().toString(16).slice(2)}`
+      );
+      const fd = fs.openSync(probe, 'wx');
+      fs.closeSync(fd);
+      fs.unlinkSync(probe);
+      return dir;
+    } catch {}
+  }
+  throw new Error('存储目录不可写');
+}
+
+function getPurchaseOrdersStorageRoot() {
+  const preferred = path.resolve(__dirname, '..', '..', '数据库', '采购单列表');
+  const viaLocal = path.resolve(__dirname, '..', '数据库', '采购单列表');
+  tryEnsureDbJunction();
+  return pickWritableDir([preferred, viaLocal]);
 }
 
 let purchaseConfigPromise = null;
@@ -109,7 +163,8 @@ async function resolvePurchaseOrdersConfig() {
     const columns = {
       id: pickColumn(fields, ['id', 'Id', 'ID']),
       name: pickColumn(fields, ['name', 'Name']),
-      filePath: pickColumn(fields, ['file_path', 'File_path', 'filepath', 'path'])
+      filePath: pickColumn(fields, ['file_path', 'File_path', 'filepath', 'path']),
+      createdAt: pickColumn(fields, ['created_at', 'Created_at', 'create_time', 'createdTime'])
     };
 
     if (!columns.id || !columns.name || !columns.filePath) {
@@ -121,29 +176,43 @@ async function resolvePurchaseOrdersConfig() {
   return purchaseConfigPromise;
 }
 
-const uploadDir = path.join(__dirname, '..', 'uploads', 'purchase-orders');
-fs.mkdirSync(uploadDir, { recursive: true });
+async function ensurePurchaseCreatedAt(config) {
+  const table = config.table;
+  const [lowerRows] = await pool.query(`SHOW COLUMNS FROM ${quoteIdent(table)} LIKE ?`, ['created_at']);
+  const [upperRows] = await pool.query(`SHOW COLUMNS FROM ${quoteIdent(table)} LIKE ?`, ['Created_at']);
+
+  if (lowerRows.length > 0) {
+    config.columns.createdAt = 'created_at';
+    return config;
+  }
+  if (upperRows.length > 0) {
+    config.columns.createdAt = 'Created_at';
+    return config;
+  }
+
+  const col = 'created_at';
+  await pool.query(
+    `ALTER TABLE ${quoteIdent(table)} ADD COLUMN ${quoteIdent(col)} TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP`
+  );
+  config.columns.createdAt = col;
+  return config;
+}
 
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => {
-      const originalName = safeBasename(normalizeIncomingFilename(file.originalname));
-      cb(null, `${Date.now()}_${originalName}`);
-    }
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 }
 });
 
 router.get('/', async (req, res) => {
   try {
-    const config = await resolvePurchaseOrdersConfig();
+    const config = await ensurePurchaseCreatedAt(await resolvePurchaseOrdersConfig());
     const { table, columns } = config;
 
     const select = [
       `${quoteIdent(columns.id)} AS id`,
       `${quoteIdent(columns.name)} AS name`,
-      `${quoteIdent(columns.filePath)} AS file_path`
+      `${quoteIdent(columns.filePath)} AS file_path`,
+      columns.createdAt ? `${quoteIdent(columns.createdAt)} AS created_at` : `NULL AS created_at`
     ].join(', ');
 
     const [rows] = await pool.query(
@@ -161,17 +230,27 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const file = req.file;
     if (!file) return res.status(400).json({ success: false, error: '未选择文件' });
 
-    const config = await resolvePurchaseOrdersConfig();
+    const config = await ensurePurchaseCreatedAt(await resolvePurchaseOrdersConfig());
     const { table, columns } = config;
 
     const originalName = safeBasename(normalizeIncomingFilename(file.originalname));
     const originalBaseName = path.parse(originalName).name || originalName;
-    const name = String(req.body?.name ?? '').trim() || originalBaseName;
-    const relativePath = path.join('uploads', 'purchase-orders', file.filename).replace(/\\/g, '/');
+    const ext = path.extname(originalName).replace(/^\./, '').toLowerCase() || 'bin';
+    const wantedInput = safeBaseName(String(req.body?.name ?? ''));
+    const wantedBaseName = (wantedInput ? path.parse(wantedInput).name : '') || originalBaseName;
+    const name = wantedBaseName;
+
+    const purchaseDir = getPurchaseOrdersStorageRoot();
+    const { filename: diskName, absPath } = buildUniqueFilename(purchaseDir, wantedBaseName, ext);
+    fs.writeFileSync(absPath, file.buffer);
+
+    const relativePath = path.join('数据库', '采购单列表', diskName).replace(/\\/g, '/');
 
     const [result] = await pool.query(
-      `INSERT INTO ${quoteIdent(table)} (${quoteIdent(columns.name)}, ${quoteIdent(columns.filePath)}) VALUES (?, ?)`,
-      [name, relativePath]
+      `INSERT INTO ${quoteIdent(table)} (${quoteIdent(columns.name)}, ${quoteIdent(columns.filePath)}, ${quoteIdent(
+        columns.createdAt
+      )}) VALUES (?, ?, ?)`,
+      [name, relativePath, new Date()]
     );
 
     res.json({ success: true, data: { id: result.insertId } });
@@ -227,23 +306,42 @@ router.delete('/:id', async (req, res) => {
     const row = rows[0];
     const filePathValue = row[columns.filePath] ?? row.file_path ?? row.File_path;
     let fileDeleted = false;
+    let fileMissing = false;
     if (filePathValue) {
       const raw = String(filePathValue).trim().replace(/\\/g, '/');
-      if (raw.toLowerCase().startsWith('uploads/')) {
-        const abs = resolveAbsFilePath(raw);
-        if (abs) {
-          const uploadsRoot = path.resolve(__dirname, '..', 'uploads') + path.sep;
-          const resolved = path.resolve(abs);
-          if (resolved.startsWith(uploadsRoot)) {
-            fs.unlinkSync(resolved);
-            fileDeleted = true;
-          }
+      let abs = null;
+      if (path.isAbsolute(raw)) {
+        abs = raw;
+      } else {
+        const normalized = raw.replace(/^[/\\]+/, '');
+        const localAbs = path.join(__dirname, '..', normalized);
+        abs = fs.existsSync(localAbs) ? localAbs : resolveAbsFilePath(raw);
+      }
+      if (!abs) {
+        fileMissing = true;
+      } else {
+        const resolved = path.resolve(abs);
+        const allowedRoots = [
+          path.resolve(__dirname, '..', '数据库', '采购单列表') + path.sep,
+          path.resolve(__dirname, '..', '..', '数据库', '采购单列表') + path.sep,
+          path.resolve(__dirname, '..', 'uploads') + path.sep,
+          path.resolve(__dirname, '..', '..', '合同生成', 'templates') + path.sep
+        ];
+        const allowed = allowedRoots.some((r) => resolved.startsWith(r));
+        if (!allowed) {
+          return res.status(500).json({ success: false, error: '文件路径不允许删除' });
+        }
+        try {
+          fs.unlinkSync(resolved);
+          fileDeleted = true;
+        } catch (e) {
+          return res.status(500).json({ success: false, error: `删除文件失败：${e.code || 'ERROR'}` });
         }
       }
     }
 
     await pool.query(`DELETE FROM ${quoteIdent(table)} WHERE ${quoteIdent(columns.id)} = ?`, [id]);
-    res.json({ success: true, data: { id: Number(id), fileDeleted } });
+    res.json({ success: true, data: { id: Number(id), fileDeleted, fileMissing } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: '删除失败' });

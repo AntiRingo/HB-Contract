@@ -184,6 +184,165 @@
   align-items: center;
 }
 
+.nameRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 10px;
+}
+
+.input {
+  flex: 1;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+}
+
+.input:disabled {
+  opacity: 0.7;
+  background: #f8fafc;
+}
+
+.listWrap {
+  overflow: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #f8fafc;
+  padding: 10px;
+}
+
+.listTable {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 720px;
+  background: #ffffff;
+}
+
+.listTable th,
+.listTable td {
+  border: 1px solid #e2e8f0;
+  padding: 10px 12px;
+  font-size: 13px;
+  vertical-align: middle;
+}
+
+.listTable th {
+  background: #f8fafc;
+  font-weight: 600;
+  text-align: center;
+}
+
+.colIndex {
+  width: 70px;
+}
+
+.colTime {
+  width: 220px;
+}
+
+.colOps {
+  width: 220px;
+}
+
+.opBtns {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.miniBtn {
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  cursor: pointer;
+  width: 100%;
+}
+
+.miniBtn.primary {
+  border-color: #bfdbfe;
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.miniBtn.danger {
+  border-color: #fecaca;
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.modalOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+  z-index: 9999;
+}
+
+.modalOverlay.open {
+  display: flex;
+}
+
+.modal {
+  width: min(1100px, 100%);
+  max-height: 90vh;
+  background: #ffffff;
+  border-radius: 14px;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.25);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.modalHeader {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #f8fafc;
+}
+
+.modalTitle {
+  font-weight: 700;
+  color: #0f172a;
+  flex: 1;
+}
+
+.modalSelect {
+  height: 32px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  padding: 0 10px;
+  background: #ffffff;
+}
+
+.modalClose {
+  height: 32px;
+  width: 36px;
+  border-radius: 10px;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 30px;
+}
+
+.modalBody {
+  padding: 14px;
+  overflow: auto;
+}
+
+.modalPreview {
+  max-height: 72vh;
+}
+
 .editBadge {
   font-size: 12px;
   background: #dcfce7;

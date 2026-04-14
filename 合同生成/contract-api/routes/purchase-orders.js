@@ -4,6 +4,9 @@ const path = require('path');
 const fs = require('fs');
 const pool = require('../db');
 
+const projectRootDir = path.resolve(__dirname, '../..');
+const purchaseStorageDir = path.resolve(projectRootDir, '../数据库/采购单列表');
+
 function quoteIdent(ident) {
     return `\`${String(ident).replace(/`/g, '``')}\``;
 }
@@ -39,7 +42,17 @@ function resolveAbsoluteFilePath(filePathValue) {
     if (/^https?:\/\//i.test(raw)) return null;
     if (path.isAbsolute(raw)) return raw;
     const normalized = raw.replace(/^[/\\]+/, '');
-    return path.join(__dirname, '../../', normalized);
+    const baseName = path.basename(normalized);
+    const candidates = [
+        path.resolve(purchaseStorageDir, normalized),
+        path.resolve(purchaseStorageDir, baseName),
+        path.resolve(projectRootDir, normalized),
+        path.resolve(projectRootDir, baseName),
+    ];
+    for (const p of candidates) {
+        if (fs.existsSync(p)) return p;
+    }
+    return candidates[0] ?? null;
 }
 
 const table = '采购单列表';
@@ -90,4 +103,3 @@ router.get('/:id/download', async (req, res) => {
 });
 
 module.exports = router;
-

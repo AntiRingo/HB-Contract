@@ -24,6 +24,25 @@ function safeBasename(filename) {
   return base.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_').slice(0, 180) || 'file';
 }
 
+function safeBaseName(name) {
+  const s = String(name ?? '').trim();
+  const base = s.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_').replace(/\s+/g, ' ');
+  return base.slice(0, 180).trim();
+}
+
+function buildUniqueFilename(dir, baseName, ext) {
+  const base = safeBaseName(baseName) || 'file';
+  const cleanExt = String(ext ?? '').replace(/^\./, '').trim().toLowerCase() || 'bin';
+  const tryPath = (n) =>
+    path.join(dir, n === 0 ? `${base}.${cleanExt}` : `${base}_${n}.${cleanExt}`);
+
+  for (let n = 0; n < 1000; n++) {
+    const p = tryPath(n);
+    if (!fs.existsSync(p)) return { filename: path.basename(p), absPath: p };
+  }
+  throw new Error('无法生成唯一文件名');
+}
+
 function scoreFilename(str) {
   const s = String(str ?? '');
   const cjk = (s.match(/[\u4E00-\u9FFF]/g) || []).length;
@@ -84,6 +103,7 @@ function resolveAbsFilePath(filePathValue) {
   const normalized = raw.replace(/^[/\\]+/, '');
   const candidates = [
     path.join(__dirname, '..', normalized),
+    path.join(__dirname, '..', '..', normalized),
     path.join(__dirname, '..', '..', '合同生成', normalized)
   ];
   for (const p of candidates) {
@@ -91,6 +111,40 @@ function resolveAbsFilePath(filePathValue) {
   }
   return null;
 }   
+
+function tryEnsureDbJunction() {
+  const link = path.resolve(__dirname, '..', '数据库');
+  const target = path.resolve(__dirname, '..', '..', '数据库');
+  try {
+    if (!fs.existsSync(link) && fs.existsSync(target)) {
+      fs.symlinkSync(target, link, 'junction');
+    }
+  } catch {}
+}
+
+function pickWritableDir(candidates) {
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const probe = path.join(
+        dir,
+        `.write_probe_${process.pid}_${Date.now()}_${Math.random().toString(16).slice(2)}`
+      );
+      const fd = fs.openSync(probe, 'wx');
+      fs.closeSync(fd);
+      fs.unlinkSync(probe);
+      return dir;
+    } catch {}
+  }
+  throw new Error('存储目录不可写');
+}
+
+function getTemplatesStorageRoot() {
+  const preferred = path.resolve(__dirname, '..', '..', '数据库', '合同模板列表');
+  const viaLocal = path.resolve(__dirname, '..', '数据库', '合同模板列表');
+  tryEnsureDbJunction();
+  return pickWritableDir([preferred, viaLocal]);
+}
 
 let templatesConfigPromise = null;
 async function resolveTemplatesConfig() {
@@ -215,13 +269,14 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const originalName = safeBasename(normalizeIncomingFilename(file.originalname));
     const ext = path.extname(originalName).replace(/^\./, '').toLowerCase() || 'bin';
     const originalBaseName = path.parse(originalName).name || originalName;
-    const name = String(req.body?.name ?? '').trim() || originalBaseName;
+    const wantedInput = safeBaseName(String(req.body?.name ?? ''));
+    const wantedBaseName = (wantedInput ? path.parse(wantedInput).name : '') || originalBaseName;
+    const name = wantedBaseName;
 
-    const uploadsDir = path.join(__dirname, '..', 'uploads', 'templates');
-    fs.mkdirSync(uploadsDir, { recursive: true });
-    const diskName = `${Date.now()}_${originalName}`;
-    const relativePath = path.join('uploads', 'templates', diskName).replace(/\\/g, '/');
-    fs.writeFileSync(path.join(uploadsDir, diskName), file.buffer);
+    const templatesDir = getTemplatesStorageRoot();
+    const { filename: diskName, absPath } = buildUniqueFilename(templatesDir, wantedBaseName, ext);
+    const relativePath = path.join('数据库', '合同模板列表', diskName).replace(/\\/g, '/');
+    fs.writeFileSync(absPath, file.buffer);
 
     const insertCols = [];
     const placeholders = [];
@@ -258,7 +313,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     if (columns.fileName) {
       insertCols.push(columns.fileName);
       placeholders.push('?');
-      params.push(originalName);
+      params.push(diskName);
     }
 
     const sql = `INSERT INTO ${quoteIdent(table)} (${insertCols
@@ -353,23 +408,42 @@ router.delete('/:id', async (req, res) => {
 
     const filePathValue = (columns.filePath ? row[columns.filePath] : null) ?? row.file_path ?? row.File_path;
     let fileDeleted = false;
+    let fileMissing = false;
     if (filePathValue) {
       const raw = String(filePathValue).trim().replace(/\\/g, '/');
-      if (raw.toLowerCase().startsWith('uploads/')) {
-        const abs = resolveAbsFilePath(raw);
-        if (abs) {
-          const uploadsRoot = path.resolve(__dirname, '..', 'uploads') + path.sep;
-          const resolved = path.resolve(abs);
-          if (resolved.startsWith(uploadsRoot)) {
-            fs.unlinkSync(resolved);
-            fileDeleted = true;
-          }
+      let abs = null;
+      if (path.isAbsolute(raw)) {
+        abs = raw;
+      } else {
+        const normalized = raw.replace(/^[/\\]+/, '');
+        const localAbs = path.join(__dirname, '..', normalized);
+        abs = fs.existsSync(localAbs) ? localAbs : resolveAbsFilePath(raw);
+      }
+      if (!abs) {
+        fileMissing = true;
+      } else {
+        const resolved = path.resolve(abs);
+        const allowedRoots = [
+          path.resolve(__dirname, '..', '数据库', '合同模板列表') + path.sep,
+          path.resolve(__dirname, '..', '..', '数据库', '合同模板列表') + path.sep,
+          path.resolve(__dirname, '..', 'uploads') + path.sep,
+          path.resolve(__dirname, '..', '..', '合同生成', 'templates') + path.sep
+        ];
+        const allowed = allowedRoots.some((r) => resolved.startsWith(r));
+        if (!allowed) {
+          return res.status(500).json({ success: false, error: '文件路径不允许删除' });
+        }
+        try {
+          fs.unlinkSync(resolved);
+          fileDeleted = true;
+        } catch (e) {
+          return res.status(500).json({ success: false, error: `删除文件失败：${e.code || 'ERROR'}` });
         }
       }
     }
 
     await pool.query(`DELETE FROM ${quoteIdent(table)} WHERE ${quoteIdent(columns.id)} = ?`, [id]);
-    res.json({ success: true, data: { id: Number(id), fileDeleted } });
+    res.json({ success: true, data: { id: Number(id), fileDeleted, fileMissing } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: '删除失败' });

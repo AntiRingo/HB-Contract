@@ -210,13 +210,11 @@ async function refreshTemplates() {
     .map((r, idx) => {
       const id = escapeHtml(r.id);
       const name = escapeHtml(r.name || r.file_name || '');
-      const type = escapeHtml(r.file_type);
       const created = escapeHtml(formatDate(r.created_at));
       const displayId = escapeHtml(idx + 1);
       return `<tr>
         <td>${displayId}</td>
         <td title="${name}">${name}</td>
-        <td>${type}</td>
         <td>${created}</td>
         <td class="opCell">
           <div class="opActions">
@@ -242,12 +240,12 @@ async function refreshPurchaseOrders() {
     .map((r, idx) => {
       const id = escapeHtml(r.id);
       const name = escapeHtml(r.name || '');
-      const filePath = escapeHtml(r.file_path);
+      const created = escapeHtml(formatDate(r.created_at));
       const displayId = escapeHtml(idx + 1);
       return `<tr>
         <td>${displayId}</td>
         <td title="${name}">${name}</td>
-        <td title="${filePath}">${filePath}</td>
+        <td>${created}</td>
         <td class="opCell">
           <div class="opActions">
             <button class="btn small" data-action="preview-purchase" data-id="${id}">预览</button>
