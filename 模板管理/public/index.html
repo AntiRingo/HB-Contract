@@ -11,9 +11,10 @@
       <header class="header">
         <div>
           <h1 class="title">模板管理</h1>
-          <p class="subtitle">上传文件到合同数据库：公司合同模板、采购单</p>
+      
         </div>
         <nav class="nav">
+          <button id="openMappingBtn" class="linkButton" type="button">建立映射</button>
           <a class="link" href="/">刷新</a>
         </nav>
       </header>
@@ -24,7 +25,7 @@
             <div class="cardTitle">1) 公司合同模板（上传到数据库）</div>
             <div class="row">
               <label class="label" for="templateName">名称：</label>
-              <input id="templateName" class="input" placeholder="例如：标准采购合同" />
+              <input id="templateName" class="input" placeholder="例如：标准合同模板" />
             </div>
             <div class="row">
               <label class="label" for="templateFile">文件：</label>
@@ -38,7 +39,7 @@
           </div>
 
           <div class="card">
-            <div class="cardTitle">2) 采购单（上传到数据库）</div>
+            <div class="cardTitle">2)订购单（上传到数据库）</div>
             <div class="row">
               <label class="label" for="purchaseName">名称：</label>
               <input id="purchaseName" class="input" placeholder="例如：HB20260328-001" />
@@ -48,10 +49,10 @@
               <input id="purchaseFile" class="file" type="file" />
             </div>
             <div class="actions">
-              <button id="uploadPurchaseBtn" class="btn primary">上传采购单</button>
+              <button id="uploadPurchaseBtn" class="btn primary">上传订购单</button>
               <span id="purchaseStatus" class="status"></span>
             </div>
-            <div class="meta">采购单表通常仅保存文件路径；上传会保存文件到本地并写入数据库。</div>
+            <div class="meta">订购单表通常仅保存文件路径；上传会保存文件到本地并写入数据库。</div>
           </div>
         </div>
       </section>
@@ -74,7 +75,7 @@
       </section>
 
       <section class="panel">
-        <div class="panelTitle">已上传 - 采购单</div>
+        <div class="panelTitle">已上传 - 订购单</div>
         <div class="tableWrap">
           <table class="table">
             <thead>
@@ -101,6 +102,103 @@
           <button id="previewClose" class="btn">关闭</button>
         </div>
         <div id="previewBody" class="modalBody"></div>
+      </div>
+    </div>
+
+    <div id="mappingOverlay" class="overlay hidden" role="dialog" aria-modal="true">
+      <div class="modal">
+        <div class="modalHeader">
+          <div>
+            <div class="modalTitle">建立映射</div>
+            <div class="modalMeta">选择合同模板与订购单，解析标题行并配置映射规则</div>
+          </div>
+          <button id="mappingClose" class="btn">关闭</button>
+        </div>
+        <div class="modalBody">
+          <div class="grid">
+            <div class="card">
+              <div class="cardTitle">映射配置</div>
+              <div class="row">
+                <label class="label" for="mappingName">映射名称：</label>
+                <input id="mappingName" class="input" placeholder="例如：合同模板-采购单映射A" />
+              </div>
+              <div class="row">
+                <label class="label" for="mappingTemplateSelect">合同模板：</label>
+                <select id="mappingTemplateSelect" class="input"></select>
+              </div>
+              <div class="row">
+                <label class="label" for="mappingPurchaseSelect">订购单：</label>
+                <select id="mappingPurchaseSelect" class="input"></select>
+              </div>
+              <div class="actions">
+                <button id="mappingParseBtn" class="btn">解析标题</button>
+                <span id="mappingStatus" class="status"></span>
+              </div>
+              <div class="meta">标题行默认使用自动识别结果，可在右侧选择行后自动应用。仅支持 xlsx 文件。</div>
+            </div>
+
+            <div class="card">
+              <div class="cardTitle">标题行内容</div>
+              <div class="mappingCols">
+                <div class="mappingCol">
+                  <div class="mappingColTitle mappingColTitleRow">
+                    <span class="mappingColTitleText">合同模板标题</span>
+                    <span class="mappingColTitleControl">
+                      <span class="mappingColTitleControlLabel">选择行</span>
+                      <select id="mappingTemplateHeaderRowInput" class="rowSelect"></select>
+                    </span>
+                  </div>
+                  <div id="templateHeadersBox" class="chips"></div>
+                </div>
+                <div class="mappingCol">
+                  <div class="mappingColTitle mappingColTitleRow">
+                    <span class="mappingColTitleText">订购单标题</span>
+                    <span class="mappingColTitleControl">
+                      <span class="mappingColTitleControlLabel">选择行</span>
+                      <select id="mappingPurchaseHeaderRowInput" class="rowSelect"></select>
+                    </span>
+                  </div>
+                  <div id="purchaseHeadersBox" class="chips"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panelSubTitle">映射规则</div>
+          <div class="tableWrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th style="width: 70px">序号</th>
+                  <th>合同模板标题</th>
+                  <th>订购单标题</th>
+                  <th style="width: 140px">操作</th>
+                </tr>
+              </thead>
+              <tbody id="mappingRulesTbody"></tbody>
+            </table>
+          </div>
+          <div class="actions">
+            <button id="mappingAddRuleBtn" class="btn">新增规则</button>
+            <button id="mappingSaveBtn" class="btn primary">保存映射</button>
+          </div>
+
+          <div class="panelSubTitle">已保存映射</div>
+          <div class="tableWrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th style="width: 70px">序号</th>
+                  <th>映射名称</th>
+                  <th style="width: 120px">规则数</th>
+                  <th style="width: 190px">创建时间</th>
+                  <th style="width: 140px">操作</th>
+                </tr>
+              </thead>
+              <tbody id="mappingsTbody"></tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
 

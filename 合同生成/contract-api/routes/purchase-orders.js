@@ -11,6 +11,15 @@ function quoteIdent(ident) {
     return `\`${String(ident).replace(/`/g, '``')}\``;
 }
 
+function pickColumn(fields, candidates) {
+    const byLower = new Map(fields.map((f) => [String(f).toLowerCase(), f]));
+    for (const c of candidates) {
+        const hit = byLower.get(String(c).toLowerCase());
+        if (hit) return hit;
+    }
+    return null;
+}
+
 function normalizeToBuffer(value) {
     if (!value) return null;
     if (Buffer.isBuffer(value)) return value;
@@ -55,11 +64,38 @@ function resolveAbsoluteFilePath(filePathValue) {
     return candidates[0] ?? null;
 }
 
-const table = '采购单列表';
-const columns = { id: 'Id', name: 'Name', filePath: 'File_path' };
+let purchaseConfigPromise = null;
+async function resolvePurchaseConfig() {
+    if (purchaseConfigPromise) return purchaseConfigPromise;
+    purchaseConfigPromise = (async () => {
+        const [rows] = await pool.query('SHOW TABLES');
+        const tableNames = rows.map((r) => r[Object.keys(r)[0]]).map(String);
+        const table =
+            tableNames.find((t) => String(t).toLowerCase() === 'purchase_order') ||
+            tableNames.find((t) => t === '采购单列表') ||
+            tableNames.find((t) => String(t).includes('采购')) ||
+            null;
+        if (!table) throw new Error('未找到采购单表');
+
+        const [desc] = await pool.query(`DESCRIBE ${quoteIdent(table)}`);
+        const fields = desc.map((r) => r.Field);
+        const columns = {
+            id: pickColumn(fields, ['id', 'Id', 'ID']),
+            name: pickColumn(fields, ['name', 'Name', 'title', 'Title']),
+            filePath: pickColumn(fields, ['file_path', 'File_path', 'filepath', 'path']),
+        };
+        if (!columns.id || !columns.name || !columns.filePath) {
+            throw new Error('采购单表缺少 Id / Name / File_path 字段');
+        }
+        return { table, columns };
+    })();
+    return purchaseConfigPromise;
+}
 
 router.get('/', async (req, res) => {
     try {
+        const config = await resolvePurchaseConfig();
+        const { table, columns } = config;
         const select = [
             `${quoteIdent(columns.id)} AS id`,
             `${quoteIdent(columns.name)} AS name`,
@@ -76,6 +112,8 @@ router.get('/', async (req, res) => {
 router.get('/:id/download', async (req, res) => {
     const { id } = req.params;
     try {
+        const config = await resolvePurchaseConfig();
+        const { table, columns } = config;
         const [rows] = await pool.query(
             `SELECT * FROM ${quoteIdent(table)} WHERE ${quoteIdent(columns.id)} = ?`,
             [id]

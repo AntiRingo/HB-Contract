@@ -15,6 +15,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.use('/api/templates', require('./routes/templates'));    
 app.use('/api/purchase-orders', require('./routes/purchase-orders'));
+app.use('/api/mappings', require('./routes/mappings'));
 
 app.get(/.*/, (req, res) => {
   res.sendFile(path.join(__dirname, 'public/index.html'));

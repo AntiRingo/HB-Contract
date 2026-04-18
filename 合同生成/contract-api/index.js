@@ -31,7 +31,7 @@ app.use('/api/contracts', contractsRouter);
 app.get(/.*/, (req, res) => {
     res.sendFile(path.join(__dirname, '../public/index.html'));
 });
-
+   
 // 启动服务器
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);

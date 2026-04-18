@@ -24,6 +24,7 @@ async function resolveContractsConfig() {
     const [rows] = await pool.query('SHOW TABLES');
     const tableNames = rows.map((r) => r[Object.keys(r)[0]]).map(String);
     const table =
+        tableNames.find((t) => String(t).toLowerCase() === 'contract') ||
         tableNames.find((t) => t === '合同列表') ||
         tableNames.find((t) => t.toLowerCase() === 'contracts') ||
         null;

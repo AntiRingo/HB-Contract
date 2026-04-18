@@ -30,6 +30,23 @@ function safeBaseName(name) {
   return base.slice(0, 180).trim();
 }
 
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeWantedBaseName(inputName, uploadedExt, fallbackBaseName) {
+  const clean = safeBaseName(inputName);
+  if (!clean) return String(fallbackBaseName ?? '').trim();
+  const ext = String(uploadedExt ?? '').replace(/^\./, '').trim();
+  if (ext) {
+    const reUploaded = new RegExp(`\\.${escapeRegExp(ext)}$`, 'i');
+    if (reUploaded.test(clean)) return clean.replace(reUploaded, '');
+  }
+  const reKnown = /\.(xlsx|xls|docx|doc|pdf)$/i;
+  if (reKnown.test(clean)) return clean.replace(reKnown, '');
+  return clean;
+}
+
 function buildUniqueFilename(dir, baseName, ext) {
   const base = safeBaseName(baseName) || 'file';
   const cleanExt = String(ext ?? '').replace(/^\./, '').trim().toLowerCase() || 'bin';
@@ -157,6 +174,7 @@ async function resolveTemplatesConfig() {
       .map((t) => String(t));
 
     const table =
+      tableNames.find((t) => t.toLowerCase() === 'contract_template') ||
       tableNames.find((t) => t.toLowerCase() === 'contract_templates') ||
       tableNames.find((t) => t === '合同模板列表') ||
       tableNames.find((t) => t.includes('合同模板')) ||
@@ -193,7 +211,11 @@ async function resolveTemplatesConfig() {
       throw new Error('公司合同模板表缺少必要字段（Id/Name）');
     }
 
-    return { table, columns };
+    const byField = new Map(descRows.map((r) => [r.Field, r]));
+    const idRow = byField.get(columns.id);
+    const idAutoIncrement = String(idRow?.Extra ?? '').toLowerCase().includes('auto_increment');
+
+    return { table, columns, idAutoIncrement };
   })();
   return templatesConfigPromise;
 }
@@ -249,7 +271,7 @@ router.get('/', async (req, res) => {
     ].join(', ');
 
     const [rows] = await pool.query(
-      `SELECT ${select} FROM ${quoteIdent(table)} ORDER BY ${quoteIdent(columns.id)} DESC`
+      `SELECT ${select} FROM ${quoteIdent(table)} ORDER BY ${quoteIdent(columns.id)} ASC`
     );
     res.json({ success: true, data: rows ?? [] });
   } catch (err) {
@@ -269,8 +291,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const originalName = safeBasename(normalizeIncomingFilename(file.originalname));
     const ext = path.extname(originalName).replace(/^\./, '').toLowerCase() || 'bin';
     const originalBaseName = path.parse(originalName).name || originalName;
-    const wantedInput = safeBaseName(String(req.body?.name ?? ''));
-    const wantedBaseName = (wantedInput ? path.parse(wantedInput).name : '') || originalBaseName;
+    const wantedBaseName = normalizeWantedBaseName(req.body?.name, ext, originalBaseName);
     const name = wantedBaseName;
 
     const templatesDir = getTemplatesStorageRoot();
@@ -316,15 +337,53 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       params.push(diskName);
     }
 
-    const sql = `INSERT INTO ${quoteIdent(table)} (${insertCols
-      .map(quoteIdent)
-      .join(', ')}) VALUES (${placeholders.join(', ')})`;
+    const doInsert = async (executor) => {
+      const sql = `INSERT INTO ${quoteIdent(table)} (${insertCols
+        .map(quoteIdent)
+        .join(', ')}) VALUES (${placeholders.join(', ')})`;
+      return executor.query(sql, params);
+    };
 
-    const [result] = await pool.query(sql, params);
-    res.json({ success: true, data: { id: result.insertId } });
+    try {
+      if (config.idAutoIncrement) {
+        const [result] = await doInsert(pool);
+        res.json({ success: true, data: { id: result.insertId } });
+        return;
+      }
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        const [rows] = await conn.query(
+          `SELECT IFNULL(MAX(${quoteIdent(columns.id)}), 0) + 1 AS next_id FROM ${quoteIdent(table)} FOR UPDATE`
+        );
+        const nextId = rows?.[0]?.next_id;
+        if (!nextId) throw new Error('无法生成新的 Id');
+
+        insertCols.unshift(columns.id);
+        placeholders.unshift('?');
+        params.unshift(nextId);
+
+        await doInsert(conn);
+        await conn.commit();
+        res.json({ success: true, data: { id: nextId } });
+      } catch (e) {
+        try {
+          await conn.rollback();
+        } catch {}
+        throw e;
+      } finally {
+        conn.release();
+      }
+    } catch (e) {
+      try {
+        fs.unlinkSync(absPath);
+      } catch {}
+      throw e;
+    }
   } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, error: '上传失败' });
+    res.status(500).json({ success: false, error: '上传失败', detail: err?.code || err?.message || String(err) });
   }
 });
 

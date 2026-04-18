@@ -30,6 +30,23 @@ function safeBaseName(name) {
   return base.slice(0, 180).trim();
 }
 
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeWantedBaseName(inputName, uploadedExt, fallbackBaseName) {
+  const clean = safeBaseName(inputName);
+  if (!clean) return String(fallbackBaseName ?? '').trim();
+  const ext = String(uploadedExt ?? '').replace(/^\./, '').trim();
+  if (ext) {
+    const reUploaded = new RegExp(`\\.${escapeRegExp(ext)}$`, 'i');
+    if (reUploaded.test(clean)) return clean.replace(reUploaded, '');
+  }
+  const reKnown = /\.(xlsx|xls|docx|doc|pdf)$/i;
+  if (reKnown.test(clean)) return clean.replace(reKnown, '');
+  return clean;
+}
+
 function buildUniqueFilename(dir, baseName, ext) {
   const base = safeBaseName(baseName) || 'file';
   const cleanExt = String(ext ?? '').replace(/^\./, '').trim().toLowerCase() || 'bin';
@@ -83,6 +100,12 @@ function guessMimeFromFilePath(filePath) {
   if (ext === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   if (ext === '.doc') return 'application/msword';
   return 'application/octet-stream';
+}
+
+function extractTypeIdFromName(value) {
+  const s = String(value ?? '').trim();
+  const m = s.match(/(\d{3})$/);
+  return m ? m[1] : null;
 }
 
 function resolveAbsFilePath(filePathValue) {
@@ -148,6 +171,7 @@ async function resolvePurchaseOrdersConfig() {
       .map((t) => String(t));
 
     const table =
+      tableNames.find((t) => t.toLowerCase() === 'purchase_order') ||
       tableNames.find((t) => t === '采购单列表') ||
       tableNames.find((t) => t.includes('采购')) ||
       tableNames.find((t) => t.toLowerCase().includes('purchase')) ||
@@ -164,7 +188,8 @@ async function resolvePurchaseOrdersConfig() {
       id: pickColumn(fields, ['id', 'Id', 'ID']),
       name: pickColumn(fields, ['name', 'Name']),
       filePath: pickColumn(fields, ['file_path', 'File_path', 'filepath', 'path']),
-      createdAt: pickColumn(fields, ['created_at', 'Created_at', 'create_time', 'createdTime'])
+      createdAt: pickColumn(fields, ['created_at', 'Created_at', 'create_time', 'createdTime']),
+      typeId: pickColumn(fields, ['type_id', 'Type_id', 'type_ID', 'Type_ID'])
     };
 
     if (!columns.id || !columns.name || !columns.filePath) {
@@ -198,6 +223,31 @@ async function ensurePurchaseCreatedAt(config) {
   return config;
 }
 
+async function ensurePurchaseTypeId(config) {
+  const table = config.table;
+  const [upperRows] = await pool.query(`SHOW COLUMNS FROM ${quoteIdent(table)} LIKE ?`, ['type_ID']);
+  const [lowerRows] = await pool.query(`SHOW COLUMNS FROM ${quoteIdent(table)} LIKE ?`, ['type_id']);
+  const [camelRows] = await pool.query(`SHOW COLUMNS FROM ${quoteIdent(table)} LIKE ?`, ['Type_ID']);
+
+  if (upperRows.length > 0) {
+    config.columns.typeId = 'type_ID';
+    return config;
+  }
+  if (lowerRows.length > 0) {
+    config.columns.typeId = 'type_id';
+    return config;
+  }
+  if (camelRows.length > 0) {
+    config.columns.typeId = 'Type_ID';
+    return config;
+  }
+
+  const col = 'type_ID';
+  await pool.query(`ALTER TABLE ${quoteIdent(table)} ADD COLUMN ${quoteIdent(col)} VARCHAR(10) NULL`);
+  config.columns.typeId = col;
+  return config;
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 }
@@ -205,18 +255,19 @@ const upload = multer({
 
 router.get('/', async (req, res) => {
   try {
-    const config = await ensurePurchaseCreatedAt(await resolvePurchaseOrdersConfig());
+    const config = await ensurePurchaseTypeId(await ensurePurchaseCreatedAt(await resolvePurchaseOrdersConfig()));
     const { table, columns } = config;
 
     const select = [
       `${quoteIdent(columns.id)} AS id`,
       `${quoteIdent(columns.name)} AS name`,
       `${quoteIdent(columns.filePath)} AS file_path`,
-      columns.createdAt ? `${quoteIdent(columns.createdAt)} AS created_at` : `NULL AS created_at`
+      columns.createdAt ? `${quoteIdent(columns.createdAt)} AS created_at` : `NULL AS created_at`,
+      columns.typeId ? `${quoteIdent(columns.typeId)} AS type_id` : `NULL AS type_id`
     ].join(', ');
 
     const [rows] = await pool.query(
-      `SELECT ${select} FROM ${quoteIdent(table)} ORDER BY ${quoteIdent(columns.id)} DESC`
+      `SELECT ${select} FROM ${quoteIdent(table)} ORDER BY ${quoteIdent(columns.id)} ASC`
     );
     res.json({ success: true, data: rows ?? [] });
   } catch (err) {
@@ -230,14 +281,13 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const file = req.file;
     if (!file) return res.status(400).json({ success: false, error: '未选择文件' });
 
-    const config = await ensurePurchaseCreatedAt(await resolvePurchaseOrdersConfig());
+    const config = await ensurePurchaseTypeId(await ensurePurchaseCreatedAt(await resolvePurchaseOrdersConfig()));
     const { table, columns } = config;
 
     const originalName = safeBasename(normalizeIncomingFilename(file.originalname));
     const originalBaseName = path.parse(originalName).name || originalName;
     const ext = path.extname(originalName).replace(/^\./, '').toLowerCase() || 'bin';
-    const wantedInput = safeBaseName(String(req.body?.name ?? ''));
-    const wantedBaseName = (wantedInput ? path.parse(wantedInput).name : '') || originalBaseName;
+    const wantedBaseName = normalizeWantedBaseName(req.body?.name, ext, originalBaseName);
     const name = wantedBaseName;
 
     const purchaseDir = getPurchaseOrdersStorageRoot();
@@ -246,11 +296,16 @@ router.post('/upload', upload.single('file'), async (req, res) => {
 
     const relativePath = path.join('数据库', '采购单列表', diskName).replace(/\\/g, '/');
 
+    const typeId =
+      extractTypeIdFromName(wantedBaseName) ||
+      extractTypeIdFromName(originalBaseName) ||
+      extractTypeIdFromName(path.parse(diskName).name);
+
     const [result] = await pool.query(
       `INSERT INTO ${quoteIdent(table)} (${quoteIdent(columns.name)}, ${quoteIdent(columns.filePath)}, ${quoteIdent(
         columns.createdAt
-      )}) VALUES (?, ?, ?)`,
-      [name, relativePath, new Date()]
+      )}, ${quoteIdent(columns.typeId)}) VALUES (?, ?, ?, ?)`,
+      [name, relativePath, new Date(), typeId]
     );
 
     res.json({ success: true, data: { id: result.insertId } });
