@@ -219,6 +219,7 @@ async function fetchPurchaseOrders() {
       opt.value = String(p.id ?? "");
       opt.textContent = p.name ?? `订购单_${p.id ?? ""}`;
       if (p.file_path) opt.dataset.filePath = String(p.file_path);
+      if (p.type_id) opt.dataset.typeId = String(p.type_id);
       purchaseSelectEl.appendChild(opt);
     });
     setStatus("");
@@ -244,15 +245,21 @@ async function handlePurchaseSelectChange() {
     saveNameInputEl.disabled = true;
     saveNameInputEl.value = "";
   }
+  if (state.merged && state.mergedSheetName) {
+    try {
+      await ensureHyperFormula();
+      initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
+    } catch (e) {}
+    renderPreview(state.merged, state.mergedSheetName);
+  } else {
+    previewEl.innerHTML = "";
+  }
 
   if (!purchaseId) {
     purchaseInfoEl.textContent = "";
     purchaseSheetEl.innerHTML = "";
     purchaseSheetEl.disabled = true;
     enableActionsIfReady();
-    if (state.merged && state.mergedSheetName) {
-      renderPreview(state.merged, state.mergedSheetName);
-    }
     return;
   }
 
@@ -279,14 +286,19 @@ async function handlePurchaseSelectChange() {
     const loaded = await loadWorkbookFromArrayBuffer(buffer);
     const opt = purchaseSelectEl.options[purchaseSelectEl.selectedIndex];
     const fileName = `${opt?.text || "订购单"}.xlsx`;
+    const typeId = String(opt?.dataset?.typeId ?? "");
 
-    state.purchase = { file: { name: fileName }, workbook: loaded, buffer };
+    state.purchase = { id: purchaseId, typeId, file: { name: fileName }, workbook: loaded, buffer };
     fillSheetSelect(purchaseSheetEl, loaded);
     purchaseSheetEl.value = getFirstSheetName(loaded);
     updateFileMeta(purchaseInfoEl, { name: fileName }, loaded);
     setStatus("订购单已就绪");
 
     if (state.merged && state.mergedSheetName) {
+      try {
+        await ensureHyperFormula();
+        initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
+      } catch (e) {}
       renderPreview(state.merged, state.mergedSheetName);
     }
 
@@ -344,6 +356,7 @@ async function handleTemplateSelectChange() {
     const fileName = `${opt?.text || "合同模板"}${ext}`;
     
     state.template = { 
+      id: templateId,
       file: { name: fileName }, 
       workbook: loaded, 
       buffer 
@@ -792,56 +805,58 @@ async function insertPurchaseRowsIntoTemplate({
   templateSheetName,
   purchaseWb,
   purchaseSheetName,
+  mapping,
 }) {
   const templateWs = getWorksheet(templateWb, templateSheetName);
   const purchaseWs = getWorksheet(purchaseWb, purchaseSheetName);
   if (!templateWs) throw new Error("合同模板工作表不存在");
   if (!purchaseWs) throw new Error("订购单工作表不存在");
 
-  const maxPurchaseCol = Math.max(purchaseWs.columnCount || 0, purchaseWs.actualColumnCount || 0);
-  const headerRow = purchaseWs.getRow(1);
-  const purchaseHeaders = [];
-  for (let c = 1; c <= maxPurchaseCol; c += 1) purchaseHeaders.push(getCellText(headerRow.getCell(c)));
-  while (purchaseHeaders.length > 0 && !normalizeText(purchaseHeaders[purchaseHeaders.length - 1])) purchaseHeaders.pop();
+  const contractHeaders = Array.isArray(mapping?.config?.contract_headers)
+    ? mapping.config.contract_headers
+    : Array.isArray(mapping?.contract_headers)
+      ? mapping.contract_headers
+      : null;
+  const purchaseHeaders = Array.isArray(mapping?.config?.purchase_headers)
+    ? mapping.config.purchase_headers
+    : Array.isArray(mapping?.purchase_headers)
+      ? mapping.purchase_headers
+      : null;
+  const rules = Array.isArray(mapping?.rules) ? mapping.rules : null;
 
-  const purchaseHeaderCount = purchaseHeaders.filter((h) => normalizeText(h)).length;
-  if (purchaseHeaderCount === 0) throw new Error("订购单首行标题为空");
+  if (!contractHeaders || contractHeaders.length === 0) throw new Error("映射配置缺少 contract_headers");
+  if (!purchaseHeaders || purchaseHeaders.length === 0) throw new Error("映射配置缺少 purchase_headers");
+  if (!rules || rules.length === 0) throw new Error("映射规则为空");
 
-  const purchaseRows = [];
-  const maxPurchaseRow = Math.max(purchaseWs.rowCount || 0, purchaseWs.actualRowCount || 0);
-  for (let r = 2; r <= maxPurchaseRow; r += 1) {
-    const row = purchaseWs.getRow(r);
-    const values = [];
-    let any = false;
-    for (let c = 1; c <= purchaseHeaders.length; c += 1) {
-      const cell = row.getCell(c);
-      const text = getCellText(cell);
-      if (normalizeText(text)) any = true;
-      values.push(cell.value);
-    }
-    if (any) purchaseRows.push(values);
+  const purchaseHeaderRow = findHeaderRowInWorksheet(purchaseWs, purchaseHeaders);
+  if (!purchaseHeaderRow) throw new Error("未在订购单中找到映射配置指定的标题行");
+
+  const contractHeaderRow = findHeaderRowInWorksheet(templateWs, contractHeaders);
+  if (!contractHeaderRow) throw new Error("未在合同模板中找到映射配置指定的标题行");
+
+  const mappingPairs = [];
+  for (const r of rules) {
+    const contractHeader = normalizeText(r?.contract_header);
+    const purchaseHeader = normalizeText(r?.purchase_header);
+    if (!contractHeader || !purchaseHeader) continue;
+    const contractCol = contractHeaderRow.headerToCol.get(contractHeader);
+    const purchaseCol = purchaseHeaderRow.headerToCol.get(purchaseHeader);
+    if (!contractCol || !purchaseCol) continue;
+    mappingPairs.push({ contractCol, purchaseCol });
   }
-  if (purchaseRows.length === 0) throw new Error("订购单没有可插入的数据行");
+  if (mappingPairs.length === 0) throw new Error("映射规则未能匹配到任何列");
 
-  const hit = findHeaderRowInWorksheet(templateWs, purchaseHeaders);
-  if (!hit) throw new Error("未在合同模板中找到与订购单标题匹配的标题行（匹配数为 0）");
-
-  const headerRowMinMax = getRowNonEmptyMinMax(templateWs, hit.rowIndex) ?? { minCol: hit.minCol, maxCol: hit.maxCol };
-
-  const colForPurchaseIndex = [];
-  for (let i = 0; i < purchaseHeaders.length; i += 1) {
-    const header = normalizeText(purchaseHeaders[i]);
-    const col = header ? hit.headerToCol.get(header) : undefined;
-    if (col !== undefined) {
-      colForPurchaseIndex.push(col);
-    } else {
-      colForPurchaseIndex.push(-1); // 忽略模板中不存在的列
-    }
-  }
+  const headerRowMinMax =
+    getRowNonEmptyMinMax(templateWs, contractHeaderRow.rowIndex) ?? {
+      minCol: contractHeaderRow.minCol,
+      maxCol: contractHeaderRow.maxCol,
+    };
 
   const originCol = headerRowMinMax.minCol;
-  const maxAssignedCol = headerRowMinMax.maxCol;
-  const insertAtRow1 = hit.rowIndex + 1;
+  let maxAssignedCol = headerRowMinMax.maxCol;
+  for (const p of mappingPairs) maxAssignedCol = Math.max(maxAssignedCol, p.contractCol);
+
+  const insertAtRow1 = contractHeaderRow.rowIndex + 1;
 
   const styleSourceRow = templateWs.getRow(insertAtRow1);
   const styleByCol = new Map();
@@ -862,16 +877,21 @@ async function insertPurchaseRowsIntoTemplate({
   }
   const rowHeight = styleSourceRow.height;
 
-  const insertRowValuesList = purchaseRows.map((rowValues) => {
+  const insertRowValuesList = [];
+  const maxPurchaseRow = Math.max(purchaseWs.rowCount || 0, purchaseWs.actualRowCount || 0);
+  for (let r = purchaseHeaderRow.rowIndex + 1; r <= maxPurchaseRow; r += 1) {
+    const row = purchaseWs.getRow(r);
     const values = new Array(maxAssignedCol).fill(null);
-    for (let i = 0; i < colForPurchaseIndex.length; i += 1) {
-      const absCol = colForPurchaseIndex[i];
-      if (absCol !== -1) {
-        values[absCol - 1] = rowValues[i] ?? null;
-      }
+    let any = false;
+    for (const pair of mappingPairs) {
+      const cell = row.getCell(pair.purchaseCol);
+      const text = getCellText(cell);
+      if (normalizeText(text)) any = true;
+      values[pair.contractCol - 1] = cell.value ?? null;
     }
-    return values;
-  });
+    if (any) insertRowValuesList.push(values);
+  }
+  if (insertRowValuesList.length === 0) throw new Error("订购单没有可插入的数据行");
 
   const originalMerges = getWorksheetMergeRanges(templateWs);
   const deltaRows = insertRowValuesList.length;
@@ -941,9 +961,9 @@ async function insertPurchaseRowsIntoTemplate({
 
   return {
     insertedRows: insertRowValuesList.length,
-    headerRowIndex: hit.rowIndex,
-    matchedHeaders: hit.hitCount,
-    purchaseHeaderCount,
+    headerRowIndex: contractHeaderRow.rowIndex,
+    matchedHeaders: mappingPairs.length,
+    purchaseHeaderCount: purchaseHeaders.length,
   };
 }
 
@@ -1424,10 +1444,24 @@ async function mergeToNewWorkbook() {
   if (!state.template?.workbook || !state.purchase?.workbook) return;
   const templateSheetName = templateSheetEl.value;
   const purchaseSheetName = purchaseSheetEl.value;
+  const templateId = String(state.template?.id ?? templateSelectEl?.value ?? "");
+  const purchaseTypeId = String(state.purchase?.typeId ?? "");
+  if (!templateId) throw new Error("缺少模板 ID");
+  if (!purchaseTypeId) throw new Error("缺少订购单类型标识（type_ID）");
 
   // 使用当前在预览中（可能已编辑）的模板作为源进行克隆
   setStatus("正在准备合并环境…");
   const templateClone = await cloneWorkbook(state.template.workbook);
+
+  setStatus("正在读取映射关系…");
+  const mappingOut = await fetchJsonWithFallback(
+    `/api/mapping?template_id=${encodeURIComponent(templateId)}&purchase_type_id=${encodeURIComponent(purchaseTypeId)}`,
+  );
+  if (!mappingOut.res.ok || !mappingOut.json?.success) {
+    const msg = mappingOut.json?.error || `${mappingOut.res.status} ${mappingOut.res.statusText}`;
+    throw new Error(`映射关系读取失败：${msg}`);
+  }
+  const mapping = mappingOut.json.data;
 
   setStatus("正在生成…");
   const result = await insertPurchaseRowsIntoTemplate({
@@ -1435,6 +1469,7 @@ async function mergeToNewWorkbook() {
     templateSheetName,
     purchaseWb: state.purchase.workbook,
     purchaseSheetName,
+    mapping,
   });
 
   state.merged = templateClone;
@@ -1629,7 +1664,13 @@ purchaseSheetEl.addEventListener("change", () => {
   setStatus("");
   
   if (state.merged && state.mergedSheetName) {
-    renderPreview(state.merged, state.mergedSheetName);
+    (async () => {
+      try {
+        await ensureHyperFormula();
+        initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
+      } catch (e) {}
+      renderPreview(state.merged, state.mergedSheetName);
+    })();
   }
 });
 

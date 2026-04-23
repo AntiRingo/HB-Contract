@@ -205,6 +205,41 @@ router.get('/', async (req, res) => {
   }
 });
 
+router.get('/check', async (req, res) => {
+  try {
+    const schema = await ensureMappingsTables();
+
+    const templateIdRaw = req.query?.templateId ?? req.query?.template_id;
+    const purchaseTypeIdRaw = req.query?.purchaseTypeId ?? req.query?.purchase_type_id ?? req.query?.purchase_id;
+    const templateId = templateIdRaw != null && String(templateIdRaw).trim() !== '' ? Number(templateIdRaw) : null;
+    const purchaseTypeId =
+      purchaseTypeIdRaw != null && String(purchaseTypeIdRaw).trim() !== '' ? String(purchaseTypeIdRaw).trim() : null;
+
+    if (templateId == null || Number.isNaN(templateId)) {
+      return res.status(400).json({ success: false, error: '合同模板 template_id 不能为空' });
+    }
+    if (!purchaseTypeId) return res.status(400).json({ success: false, error: '订购单 type_ID 不能为空' });
+
+    const [rows] = await pool.query(
+      `SELECT ${quoteIdent(schema.configCols.id)} AS id,
+              ${quoteIdent(schema.configCols.name)} AS name
+       FROM ${quoteIdent(schema.configTable)}
+       WHERE ${quoteIdent(schema.configCols.purchaseId)} = ?
+         AND ${quoteIdent(schema.configCols.templateId)} = ?
+       LIMIT 1`,
+      [purchaseTypeId, templateId]
+    );
+    if (rows && rows.length > 0) {
+      res.json({ success: true, data: { exists: true, id: rows[0].id, name: rows[0].name } });
+      return;
+    }
+    res.json({ success: true, data: { exists: false } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: '服务器错误' });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
   try {
@@ -311,14 +346,14 @@ router.post('/', async (req, res) => {
         });
         return;
       }
-
+ 
       const [result] = await conn.query(
         `INSERT INTO ${quoteIdent(schema.configTable)} (${quoteIdent(schema.configCols.name)}, ${quoteIdent(
           schema.configCols.templateId
         )}, ${quoteIdent(schema.configCols.purchaseId)}, ${quoteIdent(schema.configCols.contractHeaders)}, ${quoteIdent(
           schema.configCols.purchaseHeaders
-        )}) VALUES (?, ?, ?, ?, ?)`,
-        [name, templateId, purchaseTypeId, JSON.stringify(templateHeaders), JSON.stringify(purchaseHeaders)]
+        )}, ${quoteIdent(schema.configCols.createdAt)}) VALUES (?, ?, ?, ?, ?, ?)`,
+        [name, templateId, purchaseTypeId, JSON.stringify(templateHeaders), JSON.stringify(purchaseHeaders), new Date()]
       );
       const mappingId = result.insertId;
 

@@ -83,9 +83,10 @@ async function resolvePurchaseConfig() {
             id: pickColumn(fields, ['id', 'Id', 'ID']),
             name: pickColumn(fields, ['name', 'Name', 'title', 'Title']),
             filePath: pickColumn(fields, ['file_path', 'File_path', 'filepath', 'path']),
+            typeId: pickColumn(fields, ['type_id', 'typeId', 'type_ID', 'Type_ID', 'type']),
         };
-        if (!columns.id || !columns.name || !columns.filePath) {
-            throw new Error('采购单表缺少 Id / Name / File_path 字段');
+        if (!columns.id || !columns.name || !columns.filePath || !columns.typeId) {
+            throw new Error('采购单表缺少 Id / Name / File_path / type_ID 字段');
         }
         return { table, columns };
     })();
@@ -100,6 +101,7 @@ router.get('/', async (req, res) => {
             `${quoteIdent(columns.id)} AS id`,
             `${quoteIdent(columns.name)} AS name`,
             `${quoteIdent(columns.filePath)} AS file_path`,
+            `${quoteIdent(columns.typeId)} AS type_id`,
         ].join(', ');
         const [rows] = await pool.query(`SELECT ${select} FROM ${quoteIdent(table)} ORDER BY ${quoteIdent(columns.id)} DESC`);
         res.json({ success: true, data: rows ?? [] });

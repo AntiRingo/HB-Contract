@@ -644,6 +644,20 @@ async function parseMappingHeaders() {
     if (!templateId) throw new Error('请选择合同模板');
     if (!purchaseId) throw new Error('请选择订购单');
 
+    const purchaseTypeId = getPurchaseTypeIdById(purchaseId);
+    if (!purchaseTypeId) throw new Error('无法从订购单名称解析 type_ID（需以 001/002 等三位数字结尾）');
+
+    const check = await apiJson(
+      `/api/mappings/check?templateId=${encodeURIComponent(templateId)}&purchaseTypeId=${encodeURIComponent(
+        purchaseTypeId
+      )}`
+    );
+    if (check?.data?.exists) {
+      await refreshMappings();
+      setStatus(status, '已有映射关系，请删除后再建立映射关系', 'error');
+      return;
+    }
+
     const templateSheet = await loadXlsxSheetFromDownload(`/api/templates/${encodeURIComponent(templateId)}/download`);
     const purchaseSheet = await loadXlsxSheetFromDownload(
       `/api/purchase-orders/${encodeURIComponent(purchaseId)}/download`
