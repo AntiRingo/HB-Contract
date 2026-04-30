@@ -249,7 +249,13 @@ async function handlePurchaseSelectChange() {
     try {
       await ensureHyperFormula();
       initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
-    } catch (e) {}
+    } catch (e) {
+      try {
+        if (state.hf) state.hf.destroy();
+      } catch {}
+      state.hf = null;
+      state.hfSheetId = null;
+    }
     renderPreview(state.merged, state.mergedSheetName);
   } else {
     previewEl.innerHTML = "";
@@ -298,7 +304,13 @@ async function handlePurchaseSelectChange() {
       try {
         await ensureHyperFormula();
         initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
-      } catch (e) {}
+      } catch (e) {
+        try {
+          if (state.hf) state.hf.destroy();
+        } catch {}
+        state.hf = null;
+        state.hfSheetId = null;
+      }
       renderPreview(state.merged, state.mergedSheetName);
     }
 
@@ -373,7 +385,13 @@ async function handleTemplateSelectChange() {
     try {
       await ensureHyperFormula();
       initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
-    } catch (e) {}
+    } catch (e) {
+      try {
+        if (state.hf) state.hf.destroy();
+      } catch {}
+      state.hf = null;
+      state.hfSheetId = null;
+    }
     renderPreview(state.merged, state.mergedSheetName);
 
     enableActionsIfReady();
@@ -601,10 +619,18 @@ function sanitizeFormulaForHF(formula, r) {
 
 function initFormulaEngine(ws) {
   if (!globalThis.HyperFormula) return;
+  if (!ws) {
+    try {
+      if (state.hf) state.hf.destroy();
+    } catch (e) {}
+    state.hf = null;
+    state.hfSheetId = null;
+    return;
+  }
 
   const aoa = [];
-  const rowCount = Math.max(ws.rowCount || 0, ws.actualRowCount || 0);
-  const colCount = Math.max(ws.columnCount || 0, ws.actualColumnCount || 0);
+  const rowCount = Math.max(1, Math.max(ws.rowCount || 0, ws.actualRowCount || 0));
+  const colCount = Math.max(1, Math.max(ws.columnCount || 0, ws.actualColumnCount || 0));
 
   for (let r = 1; r <= rowCount; r++) {
     const rowValues = [];
@@ -628,17 +654,24 @@ function initFormulaEngine(ws) {
   state.hf = HyperFormula.buildFromArray(aoa, {
     licenseKey: "gpl-v3",
   });
-  state.hfSheetId = state.hf.getSheetId(state.hf.getSheetNames()[0]);
+  const sheetNames = state.hf.getSheetNames();
+  const firstSheetName = Array.isArray(sheetNames) && sheetNames.length > 0 ? sheetNames[0] : null;
+  state.hfSheetId = firstSheetName ? state.hf.getSheetId(firstSheetName) : null;
 }
 
 function getCellValueWithFormula(r, c) {
-  if (state.hf && state.hfSheetId !== null) {
+  if (state.hf && state.hfSheetId !== null && state.hfSheetId !== undefined) {
     // HyperFormula 使用 0-based index
-    const val = state.hf.getCellValue({
-      sheet: state.hfSheetId,
-      row: r - 1,
-      col: c - 1,
-    });
+    let val = null;
+    try {
+      val = state.hf.getCellValue({
+        sheet: state.hfSheetId,
+        row: r - 1,
+        col: c - 1,
+      });
+    } catch (e) {
+      return null;
+    }
     
     if (val !== null && typeof val === "object" && val.error) {
       return "#ERROR!";
@@ -1647,7 +1680,13 @@ templateSheetEl.addEventListener("change", async () => {
   try {
     await ensureHyperFormula();
     initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
-  } catch (e) {}
+  } catch (e) {
+    try {
+      if (state.hf) state.hf.destroy();
+    } catch {}
+    state.hf = null;
+    state.hfSheetId = null;
+  }
   renderPreview(state.merged, state.mergedSheetName);
 });
 
@@ -1668,7 +1707,13 @@ purchaseSheetEl.addEventListener("change", () => {
       try {
         await ensureHyperFormula();
         initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
-      } catch (e) {}
+      } catch (e) {
+        try {
+          if (state.hf) state.hf.destroy();
+        } catch {}
+        state.hf = null;
+        state.hfSheetId = null;
+      }
       renderPreview(state.merged, state.mergedSheetName);
     })();
   }
