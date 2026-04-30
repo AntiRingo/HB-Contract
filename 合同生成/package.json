@@ -1,0 +1,11 @@
+{
+  "name": "contract-generator-root",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "contract-api"
+  ],
+  "scripts": {
+    "start": "node index.js"
+  }
+}
