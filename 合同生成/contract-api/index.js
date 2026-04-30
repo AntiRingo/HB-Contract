@@ -1,7 +1,14 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-require('dotenv').config();
+const fs = require('fs');
+const dotenv = require('dotenv');
+
+const rootEnvPath = path.resolve(__dirname, '../.env');
+const localEnvPath = path.resolve(__dirname, './.env');
+if (fs.existsSync(rootEnvPath)) dotenv.config({ path: rootEnvPath });
+else if (fs.existsSync(localEnvPath)) dotenv.config({ path: localEnvPath });
+else dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
