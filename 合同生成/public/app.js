@@ -7,8 +7,15 @@ const purchaseInfoEl = document.getElementById("purchaseInfo");
 const mergeBtnEl = document.getElementById("mergeBtn");
 const downloadBtnEl = document.getElementById("downloadBtn");
 const saveBtnEl = document.getElementById("saveBtn");
+const saveNameInputEl = document.getElementById("saveName");
 const statusEl = document.getElementById("status");
 const previewEl = document.getElementById("preview");
+const contractsTbodyEl = document.getElementById("contractsTbody");
+const previewModalEl = document.getElementById("previewModal");
+const modalTitleEl = document.getElementById("modalTitle");
+const modalSheetSelectEl = document.getElementById("modalSheetSelect");
+const modalCloseEl = document.getElementById("modalClose");
+const modalPreviewEl = document.getElementById("modalPreview");
 
 const state = {
   template: null,
@@ -122,6 +129,21 @@ async function fetchWithLocalFallback(pathname) {
   return response;
 }
 
+async function fetchWithLocalFallbackRequest(pathname, options) {
+  let response = await fetch(buildApiUrl(pathname), options);
+  if (!shouldTryLocalApiFallback()) return response;
+
+  if (!response.ok || isHtmlLikeResponse(response)) {
+    try {
+      const fallback = await fetch(`http://localhost:3000${pathname}`, options);
+      if (fallback.ok && !isHtmlLikeResponse(fallback)) return fallback;
+      if (!response.ok) return fallback;
+    } catch (e) {}
+  }
+
+  return response;
+}
+
 function guessExtFromFileType(fileType) {
   const t = String(fileType || "").trim().toLowerCase();
   if (!t) return ".xlsx";
@@ -197,6 +219,7 @@ async function fetchPurchaseOrders() {
       opt.value = String(p.id ?? "");
       opt.textContent = p.name ?? `订购单_${p.id ?? ""}`;
       if (p.file_path) opt.dataset.filePath = String(p.file_path);
+      if (p.type_id) opt.dataset.typeId = String(p.type_id);
       purchaseSelectEl.appendChild(opt);
     });
     setStatus("");
@@ -217,15 +240,26 @@ async function handlePurchaseSelectChange() {
   state.merged = state.template?.workbook || null;
   state.mergedSheetName = templateSheetEl.value;
   downloadBtnEl.disabled = true;
+  if (saveBtnEl) saveBtnEl.disabled = true;
+  if (saveNameInputEl) {
+    saveNameInputEl.disabled = true;
+    saveNameInputEl.value = "";
+  }
+  if (state.merged && state.mergedSheetName) {
+    try {
+      await ensureHyperFormula();
+      initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
+    } catch (e) {}
+    renderPreview(state.merged, state.mergedSheetName);
+  } else {
+    previewEl.innerHTML = "";
+  }
 
   if (!purchaseId) {
     purchaseInfoEl.textContent = "";
     purchaseSheetEl.innerHTML = "";
     purchaseSheetEl.disabled = true;
     enableActionsIfReady();
-    if (state.merged && state.mergedSheetName) {
-      renderPreview(state.merged, state.mergedSheetName);
-    }
     return;
   }
 
@@ -252,14 +286,19 @@ async function handlePurchaseSelectChange() {
     const loaded = await loadWorkbookFromArrayBuffer(buffer);
     const opt = purchaseSelectEl.options[purchaseSelectEl.selectedIndex];
     const fileName = `${opt?.text || "订购单"}.xlsx`;
+    const typeId = String(opt?.dataset?.typeId ?? "");
 
-    state.purchase = { file: { name: fileName }, workbook: loaded, buffer };
+    state.purchase = { id: purchaseId, typeId, file: { name: fileName }, workbook: loaded, buffer };
     fillSheetSelect(purchaseSheetEl, loaded);
     purchaseSheetEl.value = getFirstSheetName(loaded);
     updateFileMeta(purchaseInfoEl, { name: fileName }, loaded);
     setStatus("订购单已就绪");
 
     if (state.merged && state.mergedSheetName) {
+      try {
+        await ensureHyperFormula();
+        initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
+      } catch (e) {}
       renderPreview(state.merged, state.mergedSheetName);
     }
 
@@ -277,6 +316,11 @@ async function handleTemplateSelectChange() {
   state.template = null;
   state.merged = null;
   downloadBtnEl.disabled = true;
+  if (saveBtnEl) saveBtnEl.disabled = true;
+  if (saveNameInputEl) {
+    saveNameInputEl.disabled = true;
+    saveNameInputEl.value = "";
+  }
   previewEl.innerHTML = "";
 
   if (!templateId) {
@@ -312,6 +356,7 @@ async function handleTemplateSelectChange() {
     const fileName = `${opt?.text || "合同模板"}${ext}`;
     
     state.template = { 
+      id: templateId,
       file: { name: fileName }, 
       workbook: loaded, 
       buffer 
@@ -760,56 +805,58 @@ async function insertPurchaseRowsIntoTemplate({
   templateSheetName,
   purchaseWb,
   purchaseSheetName,
+  mapping,
 }) {
   const templateWs = getWorksheet(templateWb, templateSheetName);
   const purchaseWs = getWorksheet(purchaseWb, purchaseSheetName);
   if (!templateWs) throw new Error("合同模板工作表不存在");
   if (!purchaseWs) throw new Error("订购单工作表不存在");
 
-  const maxPurchaseCol = Math.max(purchaseWs.columnCount || 0, purchaseWs.actualColumnCount || 0);
-  const headerRow = purchaseWs.getRow(1);
-  const purchaseHeaders = [];
-  for (let c = 1; c <= maxPurchaseCol; c += 1) purchaseHeaders.push(getCellText(headerRow.getCell(c)));
-  while (purchaseHeaders.length > 0 && !normalizeText(purchaseHeaders[purchaseHeaders.length - 1])) purchaseHeaders.pop();
+  const contractHeaders = Array.isArray(mapping?.config?.contract_headers)
+    ? mapping.config.contract_headers
+    : Array.isArray(mapping?.contract_headers)
+      ? mapping.contract_headers
+      : null;
+  const purchaseHeaders = Array.isArray(mapping?.config?.purchase_headers)
+    ? mapping.config.purchase_headers
+    : Array.isArray(mapping?.purchase_headers)
+      ? mapping.purchase_headers
+      : null;
+  const rules = Array.isArray(mapping?.rules) ? mapping.rules : null;
 
-  const purchaseHeaderCount = purchaseHeaders.filter((h) => normalizeText(h)).length;
-  if (purchaseHeaderCount === 0) throw new Error("订购单首行标题为空");
+  if (!contractHeaders || contractHeaders.length === 0) throw new Error("映射配置缺少 contract_headers");
+  if (!purchaseHeaders || purchaseHeaders.length === 0) throw new Error("映射配置缺少 purchase_headers");
+  if (!rules || rules.length === 0) throw new Error("映射规则为空");
 
-  const purchaseRows = [];
-  const maxPurchaseRow = Math.max(purchaseWs.rowCount || 0, purchaseWs.actualRowCount || 0);
-  for (let r = 2; r <= maxPurchaseRow; r += 1) {
-    const row = purchaseWs.getRow(r);
-    const values = [];
-    let any = false;
-    for (let c = 1; c <= purchaseHeaders.length; c += 1) {
-      const cell = row.getCell(c);
-      const text = getCellText(cell);
-      if (normalizeText(text)) any = true;
-      values.push(cell.value);
-    }
-    if (any) purchaseRows.push(values);
+  const purchaseHeaderRow = findHeaderRowInWorksheet(purchaseWs, purchaseHeaders);
+  if (!purchaseHeaderRow) throw new Error("未在订购单中找到映射配置指定的标题行");
+
+  const contractHeaderRow = findHeaderRowInWorksheet(templateWs, contractHeaders);
+  if (!contractHeaderRow) throw new Error("未在合同模板中找到映射配置指定的标题行");
+
+  const mappingPairs = [];
+  for (const r of rules) {
+    const contractHeader = normalizeText(r?.contract_header);
+    const purchaseHeader = normalizeText(r?.purchase_header);
+    if (!contractHeader || !purchaseHeader) continue;
+    const contractCol = contractHeaderRow.headerToCol.get(contractHeader);
+    const purchaseCol = purchaseHeaderRow.headerToCol.get(purchaseHeader);
+    if (!contractCol || !purchaseCol) continue;
+    mappingPairs.push({ contractCol, purchaseCol });
   }
-  if (purchaseRows.length === 0) throw new Error("订购单没有可插入的数据行");
+  if (mappingPairs.length === 0) throw new Error("映射规则未能匹配到任何列");
 
-  const hit = findHeaderRowInWorksheet(templateWs, purchaseHeaders);
-  if (!hit) throw new Error("未在合同模板中找到与订购单标题匹配的标题行（匹配数为 0）");
-
-  const headerRowMinMax = getRowNonEmptyMinMax(templateWs, hit.rowIndex) ?? { minCol: hit.minCol, maxCol: hit.maxCol };
-
-  const colForPurchaseIndex = [];
-  for (let i = 0; i < purchaseHeaders.length; i += 1) {
-    const header = normalizeText(purchaseHeaders[i]);
-    const col = header ? hit.headerToCol.get(header) : undefined;
-    if (col !== undefined) {
-      colForPurchaseIndex.push(col);
-    } else {
-      colForPurchaseIndex.push(-1); // 忽略模板中不存在的列
-    }
-  }
+  const headerRowMinMax =
+    getRowNonEmptyMinMax(templateWs, contractHeaderRow.rowIndex) ?? {
+      minCol: contractHeaderRow.minCol,
+      maxCol: contractHeaderRow.maxCol,
+    };
 
   const originCol = headerRowMinMax.minCol;
-  const maxAssignedCol = headerRowMinMax.maxCol;
-  const insertAtRow1 = hit.rowIndex + 1;
+  let maxAssignedCol = headerRowMinMax.maxCol;
+  for (const p of mappingPairs) maxAssignedCol = Math.max(maxAssignedCol, p.contractCol);
+
+  const insertAtRow1 = contractHeaderRow.rowIndex + 1;
 
   const styleSourceRow = templateWs.getRow(insertAtRow1);
   const styleByCol = new Map();
@@ -830,16 +877,21 @@ async function insertPurchaseRowsIntoTemplate({
   }
   const rowHeight = styleSourceRow.height;
 
-  const insertRowValuesList = purchaseRows.map((rowValues) => {
+  const insertRowValuesList = [];
+  const maxPurchaseRow = Math.max(purchaseWs.rowCount || 0, purchaseWs.actualRowCount || 0);
+  for (let r = purchaseHeaderRow.rowIndex + 1; r <= maxPurchaseRow; r += 1) {
+    const row = purchaseWs.getRow(r);
     const values = new Array(maxAssignedCol).fill(null);
-    for (let i = 0; i < colForPurchaseIndex.length; i += 1) {
-      const absCol = colForPurchaseIndex[i];
-      if (absCol !== -1) {
-        values[absCol - 1] = rowValues[i] ?? null;
-      }
+    let any = false;
+    for (const pair of mappingPairs) {
+      const cell = row.getCell(pair.purchaseCol);
+      const text = getCellText(cell);
+      if (normalizeText(text)) any = true;
+      values[pair.contractCol - 1] = cell.value ?? null;
     }
-    return values;
-  });
+    if (any) insertRowValuesList.push(values);
+  }
+  if (insertRowValuesList.length === 0) throw new Error("订购单没有可插入的数据行");
 
   const originalMerges = getWorksheetMergeRanges(templateWs);
   const deltaRows = insertRowValuesList.length;
@@ -909,15 +961,16 @@ async function insertPurchaseRowsIntoTemplate({
 
   return {
     insertedRows: insertRowValuesList.length,
-    headerRowIndex: hit.rowIndex,
-    matchedHeaders: hit.hitCount,
-    purchaseHeaderCount,
+    headerRowIndex: contractHeaderRow.rowIndex,
+    matchedHeaders: mappingPairs.length,
+    purchaseHeaderCount: purchaseHeaders.length,
   };
 }
 
-function refreshPreviewValues() {
+function refreshPreviewValues(container = previewEl) {
   if (!state.hf) return;
-  const cells = previewEl.querySelectorAll("td[data-row][data-col]");
+  if (!container) return;
+  const cells = container.querySelectorAll("td[data-row][data-col]");
   cells.forEach((td) => {
     const r = parseInt(td.dataset.row);
     const c = parseInt(td.dataset.col);
@@ -929,10 +982,14 @@ function refreshPreviewValues() {
   });
 }
 
-function renderPreview(workbook, sheetName) {
+function renderPreviewInto(container, workbook, sheetName, options = {}) {
+  const readOnly = !!options.readOnly;
+  const useFormulaEngine = options.useFormulaEngine !== false;
+
+  if (!container) return;
   const ws = getWorksheet(workbook, sheetName);
   if (!ws) {
-    previewEl.textContent = "未找到工作表";
+    container.textContent = "未找到工作表";
     return;
   }
 
@@ -992,7 +1049,7 @@ function renderPreview(workbook, sheetName) {
       
       // 优先从公式引擎获取计算结果
       let displayValue = "";
-      if (state.hf) {
+      if (useFormulaEngine && state.hf) {
         const val = getCellValueWithFormula(r, c);
         displayValue = val !== null && val !== undefined ? String(val) : "";
       } else {
@@ -1002,90 +1059,80 @@ function renderPreview(workbook, sheetName) {
       const text = displayValue;
       td.innerText = text;
       
-      // 所有单元格都记录行列信息，以便公式引擎刷新
-      td.dataset.row = r;
-      td.dataset.col = c;
-      
-      // 检查单元格是否包含公式
-      const cell = row.getCell(c);
-      const isFormula = cell?.value && typeof cell.value === "object" && cell.value.formula;
-      
-      if (isFormula) {
-        // 公式单元格设置为只读
-        td.contentEditable = "false";
-        td.classList.add("formula-cell");
-        td.title = "公式单元格，无法手动修改";
-      } else {
-        // 启用可编辑
-        td.contentEditable = "true";
+      if (!readOnly) {
+        td.dataset.row = r;
+        td.dataset.col = c;
+
+        const cell = row.getCell(c);
+        const isFormula = cell?.value && typeof cell.value === "object" && cell.value.formula;
         
-        // 监听内容修改并同步回内存中的 workbook 对象
-        td.addEventListener("blur", (e) => {
-          const rowNum = parseInt(e.target.dataset.row);
-          const colNum = parseInt(e.target.dataset.col);
-          const newValue = e.target.innerText.trim();
+        if (isFormula) {
+          td.contentEditable = "false";
+          td.classList.add("formula-cell");
+          td.title = "公式单元格，无法手动修改";
+        } else {
+          td.contentEditable = "true";
           
-          const targetSheet = state.merged.getWorksheet(state.mergedSheetName);
-          if (targetSheet) {
-            const cell = targetSheet.getRow(rowNum).getCell(colNum);
+          td.addEventListener("blur", (e) => {
+            const rowNum = parseInt(e.target.dataset.row);
+            const colNum = parseInt(e.target.dataset.col);
+            const newValue = e.target.innerText.trim();
             
-            // 如果是数字，存入数字类型，否则存入字符串
-            const num = Number(newValue);
-            if (newValue !== "" && !isNaN(num)) {
-              cell.value = num;
-            } else {
-              // 保留换行符存入 Excel
-              cell.value = newValue;
-              // 设置自动换行
-              if (newValue.includes("\n")) {
-                cell.alignment = { wrapText: true };
-              }
-            }
-
-            // 同步到公式引擎并触发重新计算
-            if (state.hf && state.hfSheetId !== null) {
-              state.hf.setCellContents({
-                sheet: state.hfSheetId,
-                row: rowNum - 1,
-                col: colNum - 1
-              }, [[cell.value]]);
+            const targetSheet = state.merged.getWorksheet(state.mergedSheetName);
+            if (targetSheet) {
+              const cell = targetSheet.getRow(rowNum).getCell(colNum);
               
-              // 重新刷新预览的值，以同步公式计算结果
-              refreshPreviewValues();
-            }
-          }
-        });
-
-        // 处理按键：Enter 切换下一行，Shift + Enter 在单元格内换行
-        td.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") {
-            if (e.shiftKey) {
-              // Shift + Enter: 允许换行 (默认行为在 contentEditable 中插入换行)
-              return;
-            } else {
-              // Enter: 切换到下一行同列单元格
-              e.preventDefault();
-              const rowNum = parseInt(e.target.dataset.row);
-              const colNum = parseInt(e.target.dataset.col);
-              
-              // 寻找下一个可编辑的单元格（跳过公式单元格）
-              let nextRow = rowNum + 1;
-              let found = false;
-              while (nextRow <= endRow) {
-                const nextCell = previewEl.querySelector(`td[data-row="${nextRow}"][data-col="${colNum}"][contenteditable="true"]`);
-                if (nextCell) {
-                  nextCell.focus();
-                  found = true;
-                  break;
+              const num = Number(newValue);
+              if (newValue !== "" && !isNaN(num)) {
+                cell.value = num;
+              } else {
+                cell.value = newValue;
+                if (newValue.includes("\n")) {
+                  cell.alignment = { wrapText: true };
                 }
-                nextRow++;
               }
-              if (!found) {
-                e.target.blur();
+
+              if (useFormulaEngine && state.hf && state.hfSheetId !== null) {
+                state.hf.setCellContents({
+                  sheet: state.hfSheetId,
+                  row: rowNum - 1,
+                  col: colNum - 1
+                }, [[cell.value]]);
+                
+                refreshPreviewValues(container);
               }
             }
-          }
-        });
+          });
+
+          td.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+              if (e.shiftKey) {
+                return;
+              } else {
+                e.preventDefault();
+                const rowNum = parseInt(e.target.dataset.row);
+                const colNum = parseInt(e.target.dataset.col);
+                
+                let nextRow = rowNum + 1;
+                let found = false;
+                while (nextRow <= endRow) {
+                  const nextCell = container.querySelector(`td[data-row="${nextRow}"][data-col="${colNum}"][contenteditable="true"]`);
+                  if (nextCell) {
+                    nextCell.focus();
+                    found = true;
+                    break;
+                  }
+                  nextRow++;
+                }
+                if (!found) {
+                  e.target.blur();
+                }
+              }
+            }
+          });
+        }
+      } else {
+        td.contentEditable = "false";
       }
 
       if (!displayValue) td.className = "empty";
@@ -1095,8 +1142,12 @@ function renderPreview(workbook, sheetName) {
   }
   table.appendChild(tbody);
 
-  previewEl.innerHTML = "";
-  previewEl.appendChild(table);
+  container.innerHTML = "";
+  container.appendChild(table);
+}
+
+function renderPreview(workbook, sheetName) {
+  return renderPreviewInto(previewEl, workbook, sheetName, { readOnly: false, useFormulaEngine: true });
 }
 
 function enableActionsIfReady() {
@@ -1133,6 +1184,167 @@ function sanitizeFilenamePart(input) {
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "");
 }
+
+function computeDefaultOutputBaseName() {
+  const templateNameRaw = state.template?.file?.name?.replace(/\.(xlsx|xls)$/i, "") || "合同模板";
+  const templateName = sanitizeFilenamePart(templateNameRaw) || "合同模板";
+  const purchaseNoRaw = state.merged ? getPurchaseOrderNoFromTemplate(state.merged, state.mergedSheetName) : "";
+  const purchaseNo = sanitizeFilenamePart(purchaseNoRaw);
+  return purchaseNo ? `${templateName}_${purchaseNo}` : `${templateName}_已插入订购单`;
+}
+
+function ensureXlsxFilename(name) {
+  const s = String(name ?? "").trim();
+  if (!s) return "合同.xlsx";
+  if (/\.xlsx$/i.test(s)) return s;
+  return `${s}.xlsx`;
+}
+
+function getEffectiveOutputFilename() {
+  const typed = sanitizeFilenamePart(saveNameInputEl?.value);
+  const base = typed ? typed.replace(/\.xlsx$/i, "") : computeDefaultOutputBaseName();
+  return ensureXlsxFilename(base);
+}
+
+function formatDateTime(value) {
+  if (!value) return "";
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(
+    d.getMinutes(),
+  )}:${pad(d.getSeconds())}`;
+}
+
+function downloadArrayBuffer(arrayBuffer, filename) {
+  const blob = new Blob([arrayBuffer], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function renderContractsTable(list) {
+  if (!contractsTbodyEl) return;
+  const rows = Array.isArray(list) ? list : [];
+  contractsTbodyEl.innerHTML = "";
+  if (rows.length === 0) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="4" style="color:#64748b;">暂无数据</td>`;
+    contractsTbodyEl.appendChild(tr);
+    return;
+  }
+
+  rows.forEach((row, idx) => {
+    const tr = document.createElement("tr");
+    const name = row?.name ?? "";
+    const createdAt = formatDateTime(row?.created_at);
+    const id = String(row?.id ?? "");
+    tr.innerHTML = `
+      <td>${idx + 1}</td>
+      <td>${String(name)}</td>
+      <td>${createdAt}</td>
+      <td>
+        <div class="opBtns">
+          <button class="miniBtn" data-action="preview" data-id="${id}" data-name="${String(name)}">预览</button>
+          <button class="miniBtn primary" data-action="download" data-id="${id}" data-name="${String(name)}">下载</button>
+          <button class="miniBtn danger" data-action="delete" data-id="${id}" data-name="${String(name)}">删除</button>
+        </div>
+      </td>
+    `;
+    contractsTbodyEl.appendChild(tr);
+  });
+}
+
+async function fetchContractsList() {
+  if (!contractsTbodyEl) return;
+  try {
+    const out = await fetchJsonWithFallback("/api/contracts");
+    const res = out.res;
+    const json = out.json;
+    if (!res.ok || !json?.success) {
+      const msg = json?.error || `${res.status} ${res.statusText}`;
+      throw new Error(msg);
+    }
+    const list = Array.isArray(json.data) ? json.data : [];
+    renderContractsTable(list);
+  } catch (e) {
+    renderContractsTable([]);
+  }
+}
+
+const modalState = {
+  workbook: null,
+  sheetName: null,
+  title: "",
+};
+
+function closePreviewModal() {
+  if (!previewModalEl) return;
+  previewModalEl.classList.remove("open");
+  previewModalEl.setAttribute("aria-hidden", "true");
+  modalState.workbook = null;
+  modalState.sheetName = null;
+  if (modalTitleEl) modalTitleEl.textContent = "预览";
+  if (modalSheetSelectEl) modalSheetSelectEl.innerHTML = "";
+  if (modalPreviewEl) modalPreviewEl.innerHTML = "";
+}
+
+function openPreviewModal(title, workbook) {
+  if (!previewModalEl || !modalPreviewEl) return;
+  modalState.workbook = workbook || null;
+  modalState.title = String(title || "预览");
+  if (modalTitleEl) modalTitleEl.textContent = modalState.title;
+
+  if (modalSheetSelectEl) {
+    modalSheetSelectEl.innerHTML = "";
+    const sheets = Array.isArray(workbook?.worksheets) ? workbook.worksheets : [];
+    for (const ws of sheets) {
+      const opt = document.createElement("option");
+      opt.value = ws.name;
+      opt.textContent = ws.name;
+      modalSheetSelectEl.appendChild(opt);
+    }
+    modalState.sheetName = sheets[0]?.name || "";
+    if (modalState.sheetName) modalSheetSelectEl.value = modalState.sheetName;
+  } else {
+    modalState.sheetName = workbook?.worksheets?.[0]?.name || "";
+  }
+
+  if (modalState.sheetName) {
+    renderPreviewInto(modalPreviewEl, workbook, modalState.sheetName, { readOnly: true, useFormulaEngine: false });
+  } else {
+    modalPreviewEl.textContent = "未找到工作表";
+  }
+
+  previewModalEl.classList.add("open");
+  previewModalEl.setAttribute("aria-hidden", "false");
+}
+
+if (modalCloseEl) modalCloseEl.addEventListener("click", closePreviewModal);
+if (previewModalEl) {
+  previewModalEl.addEventListener("click", (e) => {
+    if (e.target === previewModalEl) closePreviewModal();
+  });
+}
+if (modalSheetSelectEl) {
+  modalSheetSelectEl.addEventListener("change", () => {
+    if (!modalState.workbook || !modalPreviewEl) return;
+    const sheetName = String(modalSheetSelectEl.value || "");
+    modalState.sheetName = sheetName;
+    if (!sheetName) return;
+    renderPreviewInto(modalPreviewEl, modalState.workbook, sheetName, { readOnly: true, useFormulaEngine: false });
+  });
+}
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closePreviewModal();
+});
 
 function extractPurchaseNoFromCellLabel(text) {
   const s = normalizeText(text);
@@ -1232,10 +1444,24 @@ async function mergeToNewWorkbook() {
   if (!state.template?.workbook || !state.purchase?.workbook) return;
   const templateSheetName = templateSheetEl.value;
   const purchaseSheetName = purchaseSheetEl.value;
+  const templateId = String(state.template?.id ?? templateSelectEl?.value ?? "");
+  const purchaseTypeId = String(state.purchase?.typeId ?? "");
+  if (!templateId) throw new Error("缺少模板 ID");
+  if (!purchaseTypeId) throw new Error("缺少订购单类型标识（type_ID）");
 
   // 使用当前在预览中（可能已编辑）的模板作为源进行克隆
   setStatus("正在准备合并环境…");
   const templateClone = await cloneWorkbook(state.template.workbook);
+
+  setStatus("正在读取映射关系…");
+  const mappingOut = await fetchJsonWithFallback(
+    `/api/mapping?template_id=${encodeURIComponent(templateId)}&purchase_type_id=${encodeURIComponent(purchaseTypeId)}`,
+  );
+  if (!mappingOut.res.ok || !mappingOut.json?.success) {
+    const msg = mappingOut.json?.error || `${mappingOut.res.status} ${mappingOut.res.statusText}`;
+    throw new Error(`映射关系读取失败：${msg}`);
+  }
+  const mapping = mappingOut.json.data;
 
   setStatus("正在生成…");
   const result = await insertPurchaseRowsIntoTemplate({
@@ -1243,6 +1469,7 @@ async function mergeToNewWorkbook() {
     templateSheetName,
     purchaseWb: state.purchase.workbook,
     purchaseSheetName,
+    mapping,
   });
 
   state.merged = templateClone;
@@ -1259,6 +1486,10 @@ async function mergeToNewWorkbook() {
 
   downloadBtnEl.disabled = false;
   if (saveBtnEl) saveBtnEl.disabled = false;
+  if (saveNameInputEl) {
+    saveNameInputEl.disabled = false;
+    saveNameInputEl.value = ensureXlsxFilename(computeDefaultOutputBaseName());
+  }
   renderPreview(templateClone, templateSheetName);
   setStatus(
     `已插入 ${result.insertedRows} 行（插入起始行：第 ${result.headerRowIndex + 2} 行；标题匹配 ${result.matchedHeaders}/${result.purchaseHeaderCount}）`,
@@ -1267,21 +1498,14 @@ async function mergeToNewWorkbook() {
 
 async function handleDownload() {
   if (!state.merged) return;
-  const templateNameRaw = state.template?.file?.name?.replace(/\.(xlsx|xls)$/i, "") || "合同模板";
-  const templateName = sanitizeFilenamePart(templateNameRaw) || "合同模板";
-  const purchaseNoRaw = getPurchaseOrderNoFromTemplate(state.merged, state.mergedSheetName);
-  const purchaseNo = sanitizeFilenamePart(purchaseNoRaw);
-  const filename = purchaseNo ? `${templateName}_${purchaseNo}.xlsx` : `${templateName}_已插入订购单.xlsx`;
+  const filename = getEffectiveOutputFilename();
   await downloadWorkbook(state.merged, filename);
 }
 
 async function handleSaveToServer() {
   if (!state.merged) return;
-  const templateNameRaw = state.template?.file?.name?.replace(/\.(xlsx|xls)$/i, "") || "合同模板";
-  const templateName = sanitizeFilenamePart(templateNameRaw) || "合同模板";
-  const purchaseNoRaw = getPurchaseOrderNoFromTemplate(state.merged, state.mergedSheetName);
-  const purchaseNo = sanitizeFilenamePart(purchaseNoRaw);
-  const baseName = purchaseNo ? `${templateName}_${purchaseNo}` : `${templateName}_已插入订购单`;
+  const filename = getEffectiveOutputFilename();
+  const baseName = filename.replace(/\.xlsx$/i, "");
 
   try {
     setStatus("正在保存到服务器…");
@@ -1297,6 +1521,7 @@ async function handleSaveToServer() {
       throw new Error(msg);
     }
     setStatus("已保存到合同列表");
+    fetchContractsList();
   } catch (e) {
     setStatus(`保存失败：${e?.message ?? e}`);
   }
@@ -1309,11 +1534,103 @@ mergeBtnEl.addEventListener("click", () => {
     state.merged = null;
     state.mergedSheetName = null;
     downloadBtnEl.disabled = true;
+    if (saveBtnEl) saveBtnEl.disabled = true;
+    if (saveNameInputEl) {
+      saveNameInputEl.disabled = true;
+      saveNameInputEl.value = "";
+    }
     setStatus(`生成失败：${e?.message ?? e}`);
   });
 });
 downloadBtnEl.addEventListener("click", handleDownload);
 if (saveBtnEl) saveBtnEl.addEventListener("click", handleSaveToServer);
+if (contractsTbodyEl) {
+  contractsTbodyEl.addEventListener("click", (ev) => {
+    const btn = ev.target?.closest?.("button[data-action]");
+    if (!btn) return;
+    const action = btn.dataset.action;
+    const id = btn.dataset.id;
+    const name = btn.dataset.name || "";
+    if (!id) return;
+
+    if (action === "download") {
+      (async () => {
+        try {
+          const response = await fetchWithLocalFallback(`/api/contracts/${encodeURIComponent(id)}/download`);
+          if (!response.ok) {
+            const text = await response.text().catch(() => "");
+            const parsed = (() => {
+              try {
+                return JSON.parse(text);
+              } catch {
+                return null;
+              }
+            })();
+            const msg = parsed?.error || parsed?.message || text || `${response.status} ${response.statusText}`;
+            throw new Error(msg);
+          }
+          const buffer = await response.arrayBuffer();
+          const filename = ensureXlsxFilename(sanitizeFilenamePart(name) || `contract_${id}`);
+          downloadArrayBuffer(buffer, filename);
+        } catch (e) {
+          setStatus(`下载失败：${e?.message ?? e}`);
+        }
+      })();
+      return;
+    }
+
+    if (action === "preview") {
+      (async () => {
+        try {
+          setStatus("正在加载预览…");
+          const response = await fetchWithLocalFallback(`/api/contracts/${encodeURIComponent(id)}/download`);
+          if (!response.ok) {
+            const text = await response.text().catch(() => "");
+            const parsed = (() => {
+              try {
+                return JSON.parse(text);
+              } catch {
+                return null;
+              }
+            })();
+            const msg = parsed?.error || parsed?.message || text || `${response.status} ${response.statusText}`;
+            throw new Error(msg);
+          }
+          const buffer = await response.arrayBuffer();
+          const wb = await loadWorkbookFromArrayBuffer(buffer);
+          openPreviewModal(`预览 - ${name || id}`, wb);
+          setStatus("");
+        } catch (e) {
+          setStatus(`预览失败：${e?.message ?? e}`);
+        }
+      })();
+      return;
+    }
+
+    if (action === "delete") {
+      (async () => {
+        const ok = confirm(`确定删除合同文件：${name || id} ？`);
+        if (!ok) return;
+        try {
+          setStatus("正在删除…");
+          const res = await fetchWithLocalFallbackRequest(`/api/contracts/${encodeURIComponent(id)}`, { method: "DELETE" });
+          let json = null;
+          try {
+            json = await res.json();
+          } catch {}
+          if (!res.ok || !json?.success) {
+            const msg = json?.error || `${res.status} ${res.statusText}`;
+            throw new Error(msg);
+          }
+          setStatus("已删除");
+          fetchContractsList();
+        } catch (e) {
+          setStatus(`删除失败：${e?.message ?? e}`);
+        }
+      })();
+    }
+  });
+}
 
 templateSheetEl.addEventListener("change", async () => {
   if (!state.template?.workbook) return;
@@ -1321,6 +1638,10 @@ templateSheetEl.addEventListener("change", async () => {
   state.mergedSheetName = templateSheetEl.value;
   downloadBtnEl.disabled = true;
   if (saveBtnEl) saveBtnEl.disabled = true;
+  if (saveNameInputEl) {
+    saveNameInputEl.disabled = true;
+    saveNameInputEl.value = "";
+  }
   setStatus("");
   
   try {
@@ -1336,15 +1657,26 @@ purchaseSheetEl.addEventListener("change", () => {
   state.mergedSheetName = templateSheetEl.value;
   downloadBtnEl.disabled = true;
   if (saveBtnEl) saveBtnEl.disabled = true;
+  if (saveNameInputEl) {
+    saveNameInputEl.disabled = true;
+    saveNameInputEl.value = "";
+  }
   setStatus("");
   
   if (state.merged && state.mergedSheetName) {
-    renderPreview(state.merged, state.mergedSheetName);
+    (async () => {
+      try {
+        await ensureHyperFormula();
+        initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
+      } catch (e) {}
+      renderPreview(state.merged, state.mergedSheetName);
+    })();
   }
 });
 
 // 初始化：获取模板列表
 fetchTemplates();
 fetchPurchaseOrders();
+fetchContractsList();
  
 setStatus("");

@@ -64,8 +64,42 @@
           <span>可在此直接修改模板或生成后的内容。预览仅展示前 60 行与前 20 列。</span>
           <span class="editBadge">支持点击单元格直接修改内容</span>
         </div>
+        <div class="nameRow">
+          <label class="label" for="saveName">保存文件名：</label>
+          <input id="saveName" class="input" type="text" placeholder="生成后会自动填充默认命名" disabled />
+        </div>
         <div id="preview" class="preview"></div>
       </section>
+
+      <section class="panel">
+        <div class="panelTitle">已保存 - 合同列表</div>
+        <div class="listWrap">
+          <table class="listTable">
+            <thead>
+              <tr>
+                <th class="colIndex">序号</th>
+                <th>名称</th>
+                <th class="colTime">上传时间</th>
+                <th class="colOps">操作</th>
+              </tr>
+            </thead>
+            <tbody id="contractsTbody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <div id="previewModal" class="modalOverlay" aria-hidden="true">
+      <div class="modal">
+        <div class="modalHeader">
+          <div id="modalTitle" class="modalTitle">预览</div>
+          <select id="modalSheetSelect" class="modalSelect"></select>
+          <button id="modalClose" class="modalClose" type="button">×</button>
+        </div>
+        <div class="modalBody">
+          <div id="modalPreview" class="preview modalPreview"></div>
+        </div>
+      </div>
     </div>
 
     <script src="./app.js"></script>

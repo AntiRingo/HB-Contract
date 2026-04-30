@@ -27,11 +27,14 @@ app.use('/api/purchase-orders', purchaseOrdersRouter);
 const contractsRouter = require('./routes/contracts');
 app.use('/api/contracts', contractsRouter);
 
+const mappingRouter = require('./routes/mapping');
+app.use('/api/mapping', mappingRouter);
+
 // 对于所有其他未匹配的请求，返回 index.html（支持前端路由）
 app.get(/.*/, (req, res) => {
     res.sendFile(path.join(__dirname, '../public/index.html'));
 });
-
+   
 // 启动服务器
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);

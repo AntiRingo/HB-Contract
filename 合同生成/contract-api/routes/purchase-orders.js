@@ -4,8 +4,20 @@ const path = require('path');
 const fs = require('fs');
 const pool = require('../db');
 
+const projectRootDir = path.resolve(__dirname, '../..');
+const purchaseStorageDir = path.resolve(projectRootDir, '../数据库/采购单列表');
+
 function quoteIdent(ident) {
     return `\`${String(ident).replace(/`/g, '``')}\``;
+}
+
+function pickColumn(fields, candidates) {
+    const byLower = new Map(fields.map((f) => [String(f).toLowerCase(), f]));
+    for (const c of candidates) {
+        const hit = byLower.get(String(c).toLowerCase());
+        if (hit) return hit;
+    }
+    return null;
 }
 
 function normalizeToBuffer(value) {
@@ -39,18 +51,57 @@ function resolveAbsoluteFilePath(filePathValue) {
     if (/^https?:\/\//i.test(raw)) return null;
     if (path.isAbsolute(raw)) return raw;
     const normalized = raw.replace(/^[/\\]+/, '');
-    return path.join(__dirname, '../../', normalized);
+    const baseName = path.basename(normalized);
+    const candidates = [
+        path.resolve(purchaseStorageDir, normalized),
+        path.resolve(purchaseStorageDir, baseName),
+        path.resolve(projectRootDir, normalized),
+        path.resolve(projectRootDir, baseName),
+    ];
+    for (const p of candidates) {
+        if (fs.existsSync(p)) return p;
+    }
+    return candidates[0] ?? null;
 }
 
-const table = '采购单';
-const columns = { id: 'Id', name: 'Name', filePath: 'File_path' };
+let purchaseConfigPromise = null;
+async function resolvePurchaseConfig() {
+    if (purchaseConfigPromise) return purchaseConfigPromise;
+    purchaseConfigPromise = (async () => {
+        const [rows] = await pool.query('SHOW TABLES');
+        const tableNames = rows.map((r) => r[Object.keys(r)[0]]).map(String);
+        const table =
+            tableNames.find((t) => String(t).toLowerCase() === 'purchase_order') ||
+            tableNames.find((t) => t === '采购单列表') ||
+            tableNames.find((t) => String(t).includes('采购')) ||
+            null;
+        if (!table) throw new Error('未找到采购单表');
+
+        const [desc] = await pool.query(`DESCRIBE ${quoteIdent(table)}`);
+        const fields = desc.map((r) => r.Field);
+        const columns = {
+            id: pickColumn(fields, ['id', 'Id', 'ID']),
+            name: pickColumn(fields, ['name', 'Name', 'title', 'Title']),
+            filePath: pickColumn(fields, ['file_path', 'File_path', 'filepath', 'path']),
+            typeId: pickColumn(fields, ['type_id', 'typeId', 'type_ID', 'Type_ID', 'type']),
+        };
+        if (!columns.id || !columns.name || !columns.filePath || !columns.typeId) {
+            throw new Error('采购单表缺少 Id / Name / File_path / type_ID 字段');
+        }
+        return { table, columns };
+    })();
+    return purchaseConfigPromise;
+}
 
 router.get('/', async (req, res) => {
     try {
+        const config = await resolvePurchaseConfig();
+        const { table, columns } = config;
         const select = [
             `${quoteIdent(columns.id)} AS id`,
             `${quoteIdent(columns.name)} AS name`,
             `${quoteIdent(columns.filePath)} AS file_path`,
+            `${quoteIdent(columns.typeId)} AS type_id`,
         ].join(', ');
         const [rows] = await pool.query(`SELECT ${select} FROM ${quoteIdent(table)} ORDER BY ${quoteIdent(columns.id)} DESC`);
         res.json({ success: true, data: rows ?? [] });
@@ -63,6 +114,8 @@ router.get('/', async (req, res) => {
 router.get('/:id/download', async (req, res) => {
     const { id } = req.params;
     try {
+        const config = await resolvePurchaseConfig();
+        const { table, columns } = config;
         const [rows] = await pool.query(
             `SELECT * FROM ${quoteIdent(table)} WHERE ${quoteIdent(columns.id)} = ?`,
             [id]
@@ -90,4 +143,3 @@ router.get('/:id/download', async (req, res) => {
 });
 
 module.exports = router;
-
