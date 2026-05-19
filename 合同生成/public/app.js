@@ -760,14 +760,23 @@ function applyHorizontalMergeSpansToRows(worksheet, spans, startRow1, rowCount) 
 function restoreMergesAfterInsert(worksheet, originalMerges, thresholdRow1, deltaRows) {
   if (!originalMerges || !Array.isArray(originalMerges)) return;
 
-  // 1. 获取当前工作表所有的合并区域并备份
+  // 1. 获取当前工作表所有的合并区域
   const currentMerges = getWorksheetMergeRanges(worksheet);
   
-  // 2. 解除所有可能受影响的合并区域
-  // 只要合并区域的结束行在阈值之后，或者与插入区域有交集，就解除
+  // 2. 备份受影响区域的单元格样式 (因为 unMergeCells 会破坏样式)
+  const styleBackup = new Map();
   for (const rngStr of currentMerges) {
     const decoded = decodeRangeAddr(rngStr);
     if (decoded && decoded.e.r >= thresholdRow1) {
+      for (let r = decoded.s.r; r <= decoded.e.r; r++) {
+        const row = worksheet.getRow(r);
+        for (let c = decoded.s.c; c <= decoded.e.c; c++) {
+          const cell = row.getCell(c);
+          if (cell.style && Object.keys(cell.style).length > 0) {
+            styleBackup.set(`${r},${c}`, deepClone(cell.style));
+          }
+        }
+      }
       try {
         worksheet.unMergeCells(rngStr);
       } catch (e) {}
@@ -786,15 +795,18 @@ function restoreMergesAfterInsert(worksheet, originalMerges, thresholdRow1, delt
     if (adjDecoded.e.r < thresholdRow1) continue;
 
     try {
-      // 尝试重新合并
       worksheet.mergeCells(adjusted);
-      // 注意：这里不再调用 clearNonMasterCellsForMerge
-      // 因为在恢复过程中，非主单元格可能已经包含了刚刚填入的数据或原有内容
-      // 强制清空会导致内容丢失。Excel 渲染时会自动处理合并单元格的显示。
     } catch (e) {
       console.warn("恢复合并失败:", adjusted, e);
     }
   }
+
+  // 4. 恢复样式
+  styleBackup.forEach((style, key) => {
+    const [r, c] = key.split(",").map(Number);
+    const cell = worksheet.getRow(r).getCell(c);
+    cell.style = style;
+  });
 }
 
 function deepClone(value) {
@@ -1495,14 +1507,25 @@ async function insertPurchaseRowsIntoTemplate({
   for (let c = originCol; c <= maxAssignedCol; c += 1) {
     const cellAtInsert = styleSourceRowAtInsert.getCell(c);
     const cellAtBase = styleSourceRowAtBase.getCell(c);
-    const pickedStyleCell =
-      cellAtInsert?.style && Object.keys(cellAtInsert.style).length > 0 ? cellAtInsert : cellAtBase;
+    
+    // 选取样式的优先级：插入点行 > 标题下第一行
+    let pickedStyleCell = (cellAtInsert?.style && Object.keys(cellAtInsert.style).length > 0) ? cellAtInsert : cellAtBase;
+    
     if (pickedStyleCell?.style && Object.keys(pickedStyleCell.style).length > 0) {
       const s = deepClone(pickedStyleCell.style);
+      
+      // 优化边框逻辑：如果该列在明细区有边框，确保新生成的行拥有完整的上下边框
+      // 避免因为模板行只设置了上边框或下边框，导致新行之间没有分割线
+      if (s.border) {
+        const b = s.border;
+        if (b.top && !b.bottom) b.bottom = deepClone(b.top);
+        if (b.bottom && !b.top) b.top = deepClone(b.bottom);
+      }
+      
       styleByCol.set(c, s);
       if (!fallbackStyle) fallbackStyle = s;
     }
-    // 检查并记录公式
+    // ... 检查并记录公式 ...
     const findFormulaTemplateInCol = () => {
       const maxRow = Math.max(templateWs.rowCount || 0, templateWs.actualRowCount || 0) || baseDetailRow1;
       const end = Math.min(maxRow, baseDetailRow1 + 60);
