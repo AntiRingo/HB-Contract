@@ -1,5 +1,5 @@
  const templateSelectEl = document.getElementById("templateSelect");
-const purchaseSelectEl = document.getElementById("purchaseSelect");
+const purchaseFileEl = document.getElementById("purchaseFile");
 const templateSheetEl = document.getElementById("templateSheet");
 const purchaseSheetEl = document.getElementById("purchaseSheet");
 const templateInfoEl = document.getElementById("templateInfo");
@@ -22,6 +22,8 @@ const state = {
   purchase: null,
   merged: null,
   mergedSheetName: null,
+  mergedDocxBuffer: null,
+  mergedDocxFilename: null,
   hf: null, // HyperFormula 实例
   hfSheetId: null,
 };
@@ -155,6 +157,229 @@ function guessExtFromFileType(fileType) {
   return ".bin";
 }
 
+function isWordLikeTemplate(fileType) {
+  const t = String(fileType || "").trim().toLowerCase();
+  return t.includes("docx") || (t.includes("doc") && !t.includes("docx"));
+}
+
+function ensureDocxPreviewCss() {
+  const id = "docx-preview-inline-style";
+  if (document.getElementById(id)) return;
+  const style = document.createElement("style");
+  style.id = id;
+  style.textContent = `
+.docx-wrapper { background: #f1f5f9; padding: 16px; overflow: auto; }
+.docx-wrapper, .docx-wrapper * { box-sizing: border-box; }
+.docx-wrapper > section.docx { margin: 0 auto 16px; box-shadow: 0 2px 10px rgba(15, 23, 42, 0.08); overflow: visible; }
+.docx { max-width: 100%; }
+.docx table { border-collapse: collapse; max-width: 100%; }
+.docx * { max-width: 100%; }
+`;
+  document.head.appendChild(style);
+}
+
+function stripDocxImages(container) {
+  if (!container) return;
+  container.querySelectorAll("img").forEach((el) => el.remove());
+  container.querySelectorAll("svg image").forEach((el) => el.remove());
+  container.querySelectorAll("[style]").forEach((el) => {
+    try {
+      const bg = String(el.style.backgroundImage || "");
+      if (bg.includes("blob:") || bg.includes("data:")) el.style.backgroundImage = "none";
+    } catch {}
+  });
+}
+
+function enableDocxInlineEditing(container) {
+  if (!container) return;
+  container.dataset.docxEditable = "1";
+  const scope = container.querySelector(".docx-wrapper") || container;
+  scope.querySelectorAll(".docx p, .docx td, .docx th").forEach((el) => {
+    el.setAttribute("contenteditable", "true");
+    el.dataset.docxEditableNode = "1";
+  });
+}
+
+function disableDocxInlineEditing(container) {
+  if (!container) return;
+  try {
+    delete container.dataset.docxEditable;
+  } catch {
+    container.dataset.docxEditable = "";
+  }
+  const scope = container.querySelector(".docx-wrapper") || container;
+  scope.querySelectorAll('[data-docx-editable-node="1"]').forEach((el) => {
+    el.removeAttribute("contenteditable");
+    delete el.dataset.docxEditableNode;
+  });
+}
+
+function escapeXml(text) {
+  return String(text ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function updateDocxTcText(tcXml, text) {
+  const value = escapeXml(String(text ?? "").replace(/\r\n/g, "\n").replace(/\n/g, " "));
+  const tRe = /<w:t(\s+[^>]*)?>([\s\S]*?)<\/w:t>/g;
+  const matches = [...String(tcXml ?? "").matchAll(tRe)];
+  if (matches.length > 0) {
+    let out = String(tcXml ?? "");
+    const first = matches[0];
+    const full = first[0];
+    const attrs = first[1] ?? "";
+    const attrFixed = /xml:space=/.test(attrs) ? attrs : `${attrs} xml:space="preserve"`;
+    out = out.replace(full, `<w:t${attrFixed}>${value}</w:t>`);
+    for (let i = 1; i < matches.length; i += 1) {
+      out = out.replace(matches[i][0], `<w:t${matches[i][1] ?? ""}></w:t>`);
+    }
+    return out;
+  }
+
+  if (/<w:p[\s>]/.test(tcXml)) {
+    return String(tcXml ?? "").replace(
+      /<w:p[\s>]/,
+      (m) => `${m}<w:r><w:t xml:space="preserve">${value}</w:t></w:r>`,
+    );
+  }
+  return String(tcXml ?? "").replace(
+    /<\/w:tc>/,
+    `<w:p><w:r><w:t xml:space="preserve">${value}</w:t></w:r></w:p></w:tc>`,
+  );
+}
+
+function updateDocxPText(pXml, text) {
+  const value = escapeXml(String(text ?? "").replace(/\r\n/g, "\n").replace(/\n/g, " "));
+  const tRe = /<w:t(\s+[^>]*)?>([\s\S]*?)<\/w:t>/g;
+  const matches = [...String(pXml ?? "").matchAll(tRe)];
+  if (matches.length > 0) {
+    let out = String(pXml ?? "");
+    const first = matches[0];
+    const full = first[0];
+    const attrs = first[1] ?? "";
+    const attrFixed = /xml:space=/.test(attrs) ? attrs : `${attrs} xml:space="preserve"`;
+    out = out.replace(full, `<w:t${attrFixed}>${value}</w:t>`);
+    for (let i = 1; i < matches.length; i += 1) {
+      out = out.replace(matches[i][0], `<w:t${matches[i][1] ?? ""}></w:t>`);
+    }
+    return out;
+  }
+  return String(pXml ?? "").replace(
+    /<\/w:p>/,
+    `<w:r><w:t xml:space="preserve">${value}</w:t></w:r></w:p>`,
+  );
+}
+
+async function applyDocxEditsToArrayBuffer(originalArrayBuffer, container) {
+  const base = originalArrayBuffer;
+  if (!base) return base;
+  if (!container?.dataset?.docxEditable) return base;
+  await ensureDocxPreview();
+  if (!globalThis.JSZip) return base;
+
+  const tds = Array.from(container.querySelectorAll(".docx td, .docx th"));
+  const ps = Array.from(container.querySelectorAll(".docx p")).filter((p) => !p.closest("td,th"));
+  if (tds.length === 0 && ps.length === 0) return base;
+
+  const zip = await globalThis.JSZip.loadAsync(base);
+  const docEntry = zip.file("word/document.xml");
+  if (!docEntry) return base;
+  let documentXml = await docEntry.async("string");
+
+  if (tds.length > 0) {
+    let idx = 0;
+    const tcRe = /<w:tc[\s\S]*?<\/w:tc>/g;
+    documentXml = documentXml.replace(tcRe, (tcXml) => {
+      const td = tds[idx++];
+      if (!td) return tcXml;
+      const text = String(td.innerText ?? "").replace(/\u00A0/g, " ").trim();
+      return updateDocxTcText(tcXml, text);
+    });
+  }
+
+  if (ps.length > 0) {
+    const tblRanges = [];
+    const tblRe = /<w:tbl[\s\S]*?<\/w:tbl>/g;
+    let tm = null;
+    while ((tm = tblRe.exec(documentXml))) {
+      tblRanges.push({ s: tm.index, e: tm.index + tm[0].length });
+    }
+
+    let pIdx = 0;
+    let rangeIdx = 0;
+    const isInTable = (offset) => {
+      while (rangeIdx < tblRanges.length && offset >= tblRanges[rangeIdx].e) rangeIdx += 1;
+      if (rangeIdx >= tblRanges.length) return false;
+      return offset >= tblRanges[rangeIdx].s && offset < tblRanges[rangeIdx].e;
+    };
+
+    const pRe = /<w:p[\s\S]*?<\/w:p>/g;
+    documentXml = documentXml.replace(pRe, (pXml, offset) => {
+      if (isInTable(Number(offset) || 0)) return pXml;
+      const p = ps[pIdx++];
+      if (!p) return pXml;
+      const text = String(p.innerText ?? "").replace(/\u00A0/g, " ").trim();
+      return updateDocxPText(pXml, text);
+    });
+  }
+
+  zip.file("word/document.xml", documentXml);
+  const out = await zip.generateAsync({ type: "arraybuffer" });
+  return out;
+}
+
+function commitActivePreviewCellEdits() {
+  const active = document.activeElement;
+  if (!active) return;
+  const td = active.closest?.('td[contenteditable="true"][data-row][data-col]');
+  if (td && typeof td.blur === "function") td.blur();
+}
+
+async function renderDocxWithoutImages(arrayBuffer, container, options) {
+  ensureDocxPreviewCss();
+  await ensureDocxPreview();
+  if (!globalThis.docx?.renderAsync) throw new Error("docx-preview 未就绪");
+
+  const editable = !!(options && options.editable);
+  const safeOptions = { ...(options || {}) };
+  delete safeOptions.editable;
+
+  const renderOptions = {
+    ignoreWidth: true,
+    ignoreHeight: true,
+    breakPages: true,
+    renderHeaders: true,
+    renderFooters: true,
+    ...safeOptions,
+  };
+
+  const urlObj = globalThis.URL;
+  const originalCreateObjectURL = urlObj?.createObjectURL ? urlObj.createObjectURL.bind(urlObj) : null;
+  if (urlObj && originalCreateObjectURL) {
+    urlObj.createObjectURL = (blob) => {
+      try {
+        const type = String(blob?.type || "").toLowerCase();
+        if (type.startsWith("image/")) return "data:,";
+      } catch {}
+      return originalCreateObjectURL(blob);
+    };
+  }
+
+  try {
+    await globalThis.docx.renderAsync(arrayBuffer, container, null, renderOptions);
+  } finally {
+    if (urlObj && originalCreateObjectURL) urlObj.createObjectURL = originalCreateObjectURL;
+  }
+
+  stripDocxImages(container);
+  if (editable) enableDocxInlineEditing(container);
+  else disableDocxInlineEditing(container);
+}
+
 async function fetchTemplates() {
   try {
     setStatus("正在加载模板列表…");
@@ -196,123 +421,84 @@ async function fetchTemplates() {
   }
 }
 
-async function fetchPurchaseOrders() {
-  if (!purchaseSelectEl) return;
-  try {
-    setStatus("正在加载订购单列表…");
-    const out = await fetchJsonWithFallback("/api/purchase-orders");
-    const res = out.res;
-    const json = out.json;
-    if (!res.ok || !json?.success) {
-      const msg =
-        json?.error ||
-        json?.message ||
-        `${res.status} ${res.statusText}` ||
-        "加载订购单失败";
-      throw new Error(msg);
-    }
-
-    const list = Array.isArray(json.data) ? json.data : [];
-    purchaseSelectEl.innerHTML = '<option value="">-- 请选择订购单 --</option>';
-    list.forEach((p) => {
-      const opt = document.createElement("option");
-      opt.value = String(p.id ?? "");
-      opt.textContent = p.name ?? `订购单_${p.id ?? ""}`;
-      if (p.file_path) opt.dataset.filePath = String(p.file_path);
-      if (p.type_id) opt.dataset.typeId = String(p.type_id);
-      purchaseSelectEl.appendChild(opt);
-    });
-    setStatus("");
-    purchaseInfoEl.textContent = "";
-  } catch (e) {
-    const msg = e?.message ?? String(e);
-    console.error("加载订购单失败：", e);
-    purchaseSelectEl.innerHTML = '<option value="">加载订购单失败</option>';
-    purchaseInfoEl.textContent = `加载失败：${msg}`;
-    setStatus("订购单列表加载失败：请确认后端与数据库已就绪");
+function fetchPurchaseOrders() {
+  if (!purchaseFileEl) return;
+  if (purchaseSheetEl) {
+    purchaseSheetEl.innerHTML = "";
+    purchaseSheetEl.disabled = true;
   }
 }
 
-async function handlePurchaseSelectChange() {
-  if (!purchaseSelectEl) return;
-  const purchaseId = purchaseSelectEl.value;
+function guessPurchaseTypeIdFromFilename(filename) {
+  const base = String(filename ?? "").trim().replace(/\.(xlsx|xls)$/i, "");
+  if (!base) return "";
+  const m = base.match(/(\d{3})\s*$/);
+  return m ? m[1] : "";
+}
+
+async function handlePurchaseFileChange() {
+  if (!purchaseFileEl) return;
+  const file = purchaseFileEl.files?.[0] ?? null;
+
   state.purchase = null;
-  state.merged = state.template?.workbook || null;
-  state.mergedSheetName = templateSheetEl.value;
+  state.mergedDocxBuffer = null;
+  state.mergedDocxFilename = null;
   downloadBtnEl.disabled = true;
   if (saveBtnEl) saveBtnEl.disabled = true;
   if (saveNameInputEl) {
     saveNameInputEl.disabled = true;
     saveNameInputEl.value = "";
   }
-  if (state.merged && state.mergedSheetName) {
-    try {
-      await ensureHyperFormula();
-      initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
-    } catch (e) {
-      try {
-        if (state.hf) state.hf.destroy();
-      } catch {}
-      state.hf = null;
-      state.hfSheetId = null;
-    }
-    renderPreview(state.merged, state.mergedSheetName);
-  } else {
-    previewEl.innerHTML = "";
-  }
 
-  if (!purchaseId) {
-    purchaseInfoEl.textContent = "";
+  if (!file) {
+    if (purchaseInfoEl) purchaseInfoEl.textContent = "";
     purchaseSheetEl.innerHTML = "";
     purchaseSheetEl.disabled = true;
+    try {
+      const fileType = String(state.template?.fileType ?? "");
+      if (isWordLikeTemplate(fileType) && state.template?.buffer) {
+        previewEl.innerHTML = '<div class="meta">正在渲染 DOCX，请稍候…</div>';
+        await renderDocxWithoutImages(state.template.buffer, previewEl, {});
+      } else if (state.template?.workbook) {
+        state.merged = state.template.workbook;
+        state.mergedSheetName = templateSheetEl.value || getFirstSheetName(state.template.workbook);
+        if (state.mergedSheetName) {
+          try {
+            await ensureHyperFormula();
+            initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
+          } catch (e) {
+            try {
+              if (state.hf) state.hf.destroy();
+            } catch {}
+            state.hf = null;
+            state.hfSheetId = null;
+          }
+          renderPreview(state.merged, state.mergedSheetName);
+        } else {
+          previewEl.innerHTML = "";
+        }
+      }
+    } catch {}
     enableActionsIfReady();
     return;
   }
 
   try {
-    setStatus("正在从服务器下载订购单…");
+    setStatus("正在读取订购单…");
+    const loadedOut = await loadWorkbookFromFile(file);
+    const loaded = loadedOut.workbook;
+    const buffer = loadedOut.buffer;
 
-    const pathname = `/api/purchase-orders/${encodeURIComponent(purchaseId)}/download`;
-    const response = await fetchWithLocalFallback(pathname);
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      const parsed = (() => {
-        try {
-          return JSON.parse(text);
-        } catch (e) {
-          return null;
-        }
-      })();
-      const msg = parsed?.error || parsed?.message || text || `${response.status} ${response.statusText}`;
-      throw new Error(`无法从服务器获取订购单文件：${msg}`);
-    }
-
-    const buffer = await response.arrayBuffer();
-    const loaded = await loadWorkbookFromArrayBuffer(buffer);
-    const opt = purchaseSelectEl.options[purchaseSelectEl.selectedIndex];
-    const fileName = `${opt?.text || "订购单"}.xlsx`;
-    const typeId = String(opt?.dataset?.typeId ?? "");
-
-    state.purchase = { id: purchaseId, typeId, file: { name: fileName }, workbook: loaded, buffer };
+    const typeId = guessPurchaseTypeIdFromFilename(file.name);
+    state.purchase = { id: "local", typeId, file, workbook: loaded, buffer };
     fillSheetSelect(purchaseSheetEl, loaded);
     purchaseSheetEl.value = getFirstSheetName(loaded);
-    updateFileMeta(purchaseInfoEl, { name: fileName }, loaded);
-    setStatus("订购单已就绪");
-
-    if (state.merged && state.mergedSheetName) {
-      try {
-        await ensureHyperFormula();
-        initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
-      } catch (e) {
-        try {
-          if (state.hf) state.hf.destroy();
-        } catch {}
-        state.hf = null;
-        state.hfSheetId = null;
-      }
-      renderPreview(state.merged, state.mergedSheetName);
+    updateFileMeta(purchaseInfoEl, file, loaded);
+    if (purchaseInfoEl) {
+      const typeHint = typeId ? `；类型ID：${typeId}` : "；类型ID：未识别（文件名末尾需为3位数字）";
+      purchaseInfoEl.textContent = `${purchaseInfoEl.textContent}${typeHint}`;
     }
+    setStatus(typeId ? "订购单已就绪" : "订购单已就绪：文件名末尾需为3位数字以匹配映射配置");
 
     enableActionsIfReady();
   } catch (e) {
@@ -327,6 +513,8 @@ async function handleTemplateSelectChange() {
   const templateId = templateSelectEl.value;
   state.template = null;
   state.merged = null;
+  state.mergedDocxBuffer = null;
+  state.mergedDocxFilename = null;
   downloadBtnEl.disabled = true;
   if (saveBtnEl) saveBtnEl.disabled = true;
   if (saveNameInputEl) {
@@ -362,13 +550,47 @@ async function handleTemplateSelectChange() {
     }
     const buffer = await response.arrayBuffer();
     
-    const loaded = await loadWorkbookFromArrayBuffer(buffer);
     const opt = templateSelectEl.options[templateSelectEl.selectedIndex];
-    const ext = guessExtFromFileType(opt?.dataset?.fileType);
+    const fileType = String(opt?.dataset?.fileType ?? "");
+    const ext = guessExtFromFileType(fileType);
     const fileName = `${opt?.text || "合同模板"}${ext}`;
     
+    if (isWordLikeTemplate(fileType)) {
+      state.template = {
+        id: templateId,
+        fileType,
+        file: { name: fileName },
+        workbook: null,
+        buffer,
+      };
+
+      templateSheetEl.innerHTML = "";
+      templateSheetEl.disabled = true;
+      templateInfoEl.textContent = `文件：${fileName}；类型：${ext.replace(/^\./, "").toUpperCase()}`;
+      if (String(fileType).toLowerCase().includes("doc") && !String(fileType).toLowerCase().includes("docx")) {
+        setStatus("合同模板已就绪（DOC）");
+        previewEl.innerHTML = '<div class="meta">DOC 格式暂不支持预览，请另存为 DOCX。</div>';
+        enableActionsIfReady();
+        return;
+      }
+
+      setStatus("正在渲染 Word 模板预览…");
+      previewEl.innerHTML = '<div class="meta">正在渲染 DOCX，请稍候…</div>';
+      try {
+        await renderDocxWithoutImages(buffer, previewEl, { editable: false });
+        setStatus("合同模板已就绪（DOCX）");
+      } catch (err) {
+        previewEl.innerHTML = `<div class="meta">DOCX 预览失败：${String(err?.message ?? err)}</div>`;
+        setStatus("合同模板已就绪（DOCX）");
+      }
+      enableActionsIfReady();
+      return;
+    }
+
+    const loaded = await loadWorkbookFromArrayBuffer(buffer);
     state.template = { 
       id: templateId,
+      fileType,
       file: { name: fileName }, 
       workbook: loaded, 
       buffer 
@@ -504,40 +726,87 @@ function clearNonMasterCellsForMerge(worksheet, rangeStr) {
   }
 }
 
-function restoreMergesAfterInsert(worksheet, originalMerges, insertAtRow1, deltaRows) {
-  if (!originalMerges || !deltaRows) return;
+function getSingleRowHorizontalMergeSpansAtRow(mergeRanges, row1, minCol, maxCol) {
+  if (!Array.isArray(mergeRanges) || !row1) return [];
+  const spans = [];
+  for (const rngStr of mergeRanges) {
+    const decoded = decodeRangeAddr(rngStr);
+    if (!decoded) continue;
+    if (decoded.s.r !== row1 || decoded.e.r !== row1) continue;
+    const sC = decoded.s.c;
+    const eC = decoded.e.c;
+    if (eC < minCol || sC > maxCol) continue;
+    spans.push({ sC, eC });
+  }
+  spans.sort((a, b) => a.sC - b.sC || a.eC - b.eC);
+  return spans;
+}
 
-  // 1. 获取当前工作表所有的合并区域（包括 spliceRows 自动产生或错位的）
+function applyHorizontalMergeSpansToRows(worksheet, spans, startRow1, rowCount) {
+  if (!worksheet || !Array.isArray(spans) || spans.length === 0) return;
+  if (!startRow1 || !rowCount) return;
+  for (let i = 0; i < rowCount; i += 1) {
+    const r = startRow1 + i;
+    for (const sp of spans) {
+      if (!sp || !sp.sC || !sp.eC || sp.eC <= sp.sC) continue;
+      const addr = encodeRangeAddr(r, sp.sC, r, sp.eC);
+      try {
+        worksheet.mergeCells(addr);
+      } catch (e) {}
+    }
+  }
+}
+
+function restoreMergesAfterInsert(worksheet, originalMerges, thresholdRow1, deltaRows) {
+  if (!originalMerges || !Array.isArray(originalMerges)) return;
+
+  // 1. 获取当前工作表所有的合并区域
   const currentMerges = getWorksheetMergeRanges(worksheet);
   
-  // 2. 彻底解除所有受影响的合并：
-  //    任何结束行在插入点之后（>= insertAtRow1）的合并都需要重新处理
-  //    因为它们要么被 spliceRows 错误复制了，要么位置已经错位了
+  // 2. 备份受影响区域的单元格样式 (因为 unMergeCells 会破坏样式)
+  const styleBackup = new Map();
   for (const rngStr of currentMerges) {
     const decoded = decodeRangeAddr(rngStr);
-    if (decoded && decoded.e.r >= insertAtRow1) {
+    if (decoded && decoded.e.r >= thresholdRow1) {
+      for (let r = decoded.s.r; r <= decoded.e.r; r++) {
+        const row = worksheet.getRow(r);
+        for (let c = decoded.s.c; c <= decoded.e.c; c++) {
+          const cell = row.getCell(c);
+          if (cell.style && Object.keys(cell.style).length > 0) {
+            styleBackup.set(`${r},${c}`, deepClone(cell.style));
+          }
+        }
+      }
       try {
         worksheet.unMergeCells(rngStr);
       } catch (e) {}
     }
   }
 
-  // 3. 根据原始模板的合并规则，重新应用调整后的合并
+  // 3. 根据原始模板的合并规则，重新计算并应用合并
   for (const orig of originalMerges) {
-    const adjusted = adjustRangeByInsertRows(orig, insertAtRow1, deltaRows);
+    const adjusted = adjustRangeByInsertRows(orig, thresholdRow1, deltaRows);
     if (!adjusted) continue;
     
     const adjDecoded = decodeRangeAddr(adjusted);
-    // 如果调整后的合并区域完全在插入点上方，说明它刚才没被解除，不需要重做
-    if (adjDecoded && adjDecoded.e.r < insertAtRow1) continue;
+    if (!adjDecoded) continue;
 
-    // 清除非左上角单元格的值（避免合并后 WPS 显示重复）
-    clearNonMasterCellsForMerge(worksheet, adjusted);
-    
+    // 如果该合并区域完全在受影响区域之前，说明刚才没被解除，跳过
+    if (adjDecoded.e.r < thresholdRow1) continue;
+
     try {
       worksheet.mergeCells(adjusted);
-    } catch (e) {}
+    } catch (e) {
+      console.warn("恢复合并失败:", adjusted, e);
+    }
   }
+
+  // 4. 恢复样式
+  styleBackup.forEach((style, key) => {
+    const [r, c] = key.split(",").map(Number);
+    const cell = worksheet.getRow(r).getCell(c);
+    cell.style = style;
+  });
 }
 
 function deepClone(value) {
@@ -617,6 +886,71 @@ function sanitizeFormulaForHF(formula, r) {
   return sanitized;
 }
 
+function adjustFormulaByOffset(formula, deltaRows, deltaCols) {
+  if (!formula || typeof formula !== "string") return formula;
+  if (!deltaRows && !deltaCols) return formula;
+
+  const shiftSegment = (segment) => {
+    return segment.replace(/(\$?)([A-Z]{1,3})(\$?)(\d+)/g, (m, colAbs, col, rowAbs, rowDigits, offset) => {
+      const before = offset > 0 ? segment[offset - 1] : "";
+      const after = offset + m.length < segment.length ? segment[offset + m.length] : "";
+      if (before && /[A-Z0-9_.]/i.test(before)) return m;
+      if (after && /[A-Z0-9_]/i.test(after)) return m;
+
+      let colPart = `${colAbs}${col}`;
+      let rowPart = `${rowAbs}${rowDigits}`;
+
+      if (deltaCols && colAbs !== "$") {
+        const colNum = decodeCol(col);
+        const nextCol = colNum + deltaCols;
+        if (nextCol >= 1) colPart = `${colAbs}${encodeCol(nextCol)}`;
+      }
+
+      if (deltaRows && rowAbs !== "$") {
+        const rowNum = Number(rowDigits);
+        const nextRow = rowNum + deltaRows;
+        if (Number.isFinite(nextRow) && nextRow >= 1) rowPart = `${rowAbs}${nextRow}`;
+      }
+
+      return `${colPart}${rowPart}`;
+    });
+  };
+
+  let out = "";
+  let inString = false;
+  let start = 0;
+  let i = 0;
+  while (i < formula.length) {
+    const ch = formula[i];
+    if (ch !== '"') {
+      i += 1;
+      continue;
+    }
+
+    if (!inString) {
+      out += shiftSegment(formula.slice(start, i));
+      inString = true;
+      start = i;
+      i += 1;
+      continue;
+    }
+
+    if (i + 1 < formula.length && formula[i + 1] === '"') {
+      i += 2;
+      continue;
+    }
+
+    i += 1;
+    out += formula.slice(start, i);
+    inString = false;
+    start = i;
+  }
+
+  const tail = formula.slice(start);
+  out += inString ? tail : shiftSegment(tail);
+  return out;
+}
+
 function initFormulaEngine(ws) {
   if (!globalThis.HyperFormula) return;
   if (!ws) {
@@ -638,9 +972,25 @@ function initFormulaEngine(ws) {
     for (let c = 1; c <= colCount; c++) {
       const cell = wsRow.getCell(c);
       const val = cell.value;
-      if (val && typeof val === "object" && val.formula) {
+      if (val && typeof val === "object" && (val.formula || val.sharedFormula)) {
         // 在存入公式引擎前进行清洗
-        const sanitized = sanitizeFormulaForHF(val.formula, r);
+        let formula = val.formula;
+        if (!formula && val.sharedFormula) {
+          const masterAddr = String(val.sharedFormula);
+          const masterPos = decodeCellAddr(masterAddr);
+          const masterCell = ws.getCell(masterAddr);
+          const masterVal = masterCell?.value;
+          const masterFormula =
+            masterVal && typeof masterVal === "object" && masterVal.formula ? String(masterVal.formula) : "";
+          if (masterFormula && masterPos) {
+            const deltaR = r - masterPos.r;
+            const deltaC = c - masterPos.c;
+            formula = adjustFormulaByOffset(masterFormula, deltaR, deltaC);
+          } else if (masterFormula) {
+            formula = masterFormula;
+          }
+        }
+        const sanitized = sanitizeFormulaForHF(formula, r);
         rowValues.push("=" + sanitized);
       } else {
         rowValues.push(val);
@@ -816,21 +1166,238 @@ function getRowNonEmptyMinMax(worksheet, rowIndex1) {
 
 function adjustFormula(formula, oldRow, newRow) {
   if (!formula || typeof formula !== "string") return formula;
-  // 简单的正则替换：寻找紧跟在字母列号后的行号，并进行偏移
-  // 例如将 G9 * H9 中的 9 替换为 10 -> G10 * H10
-  // 注意：这只适用于简单的 A1 引用格式
   const diff = newRow - oldRow;
   if (diff === 0) return formula;
 
-  return formula.replace(/([A-Z]+)(\d+)/g, (match, col, row) => {
-    const rowNum = parseInt(row, 10);
-    // 只有当公式里的行号正好是模板里的示例行号时，才进行偏移
-    // 这样可以避免误伤类似 SUM(G$9:G$100) 这种绝对引用或固定区域
-    if (rowNum === oldRow) {
-      return col + newRow;
+  const shiftSegment = (segment) => {
+    return segment.replace(/(\$?)([A-Z]{1,3})(\$?)(\d+)/g, (m, colAbs, col, rowAbs, rowDigits, offset) => {
+      const before = offset > 0 ? segment[offset - 1] : "";
+      const after = offset + m.length < segment.length ? segment[offset + m.length] : "";
+      if (before && /[A-Z0-9_.]/i.test(before)) return m;
+      if (after && /[A-Z0-9_]/i.test(after)) return m;
+
+      if (rowAbs === "$") return m;
+      const rowNum = Number(rowDigits);
+      if (!Number.isFinite(rowNum)) return m;
+      const nextRow = rowNum + diff;
+      if (nextRow < 1) return m;
+      return `${colAbs}${col}${rowAbs}${nextRow}`;
+    });
+  };
+
+  let out = "";
+  let inString = false;
+  let start = 0;
+  let i = 0;
+  while (i < formula.length) {
+    const ch = formula[i];
+    if (ch !== '"') {
+      i += 1;
+      continue;
     }
-    return match;
-  });
+
+    if (!inString) {
+      out += shiftSegment(formula.slice(start, i));
+      inString = true;
+      start = i;
+      i += 1;
+      continue;
+    }
+
+    if (i + 1 < formula.length && formula[i + 1] === '"') {
+      i += 2;
+      continue;
+    }
+
+    i += 1;
+    out += formula.slice(start, i);
+    inString = false;
+    start = i;
+  }
+
+  const tail = formula.slice(start);
+  out += inString ? tail : shiftSegment(tail);
+  return out;
+}
+
+function adjustFormulaByRowThreshold(formula, thresholdRow1, deltaRows) {
+  if (!formula || typeof formula !== "string") return formula;
+  if (!deltaRows) return formula;
+  const threshold = Number(thresholdRow1);
+  if (!Number.isFinite(threshold) || threshold < 1) return formula;
+
+  const parseCellRef = (ref) => {
+    const m = String(ref || "").match(/^(\$?)([A-Z]{1,3})(\$?)(\d+)$/);
+    if (!m) return null;
+    return {
+      colAbs: m[1] || "",
+      col: m[2] || "",
+      rowAbs: m[3] || "",
+      row: Number(m[4]),
+    };
+  };
+
+  const encodeCellRef = (p) => `${p.colAbs}${p.col}${p.rowAbs}${p.row}`;
+
+  const adjustRowForInsert = (row, rowAbs, insertAtRow1, delta, mode) => {
+    if (rowAbs === "$") return row;
+    const r = Number(row);
+    if (!Number.isFinite(r)) return row;
+    if (mode === "shift") {
+      if (r < insertAtRow1) return r;
+      return Math.max(1, r + delta);
+    }
+    return r;
+  };
+
+  const adjustRangeForInsert = (a, b) => {
+    const s = parseCellRef(a);
+    const e = parseCellRef(b);
+    if (!s || !e) return `${a}:${b}`;
+
+    const sRow = s.rowAbs === "$" ? s.row : s.row;
+    const eRow = e.rowAbs === "$" ? e.row : e.row;
+    const insertAt = threshold;
+    const delta = deltaRows;
+
+    if (s.rowAbs !== "$" && sRow >= insertAt) s.row = Math.max(1, sRow + delta);
+    if (e.rowAbs !== "$") {
+      if (eRow >= insertAt) e.row = Math.max(1, eRow + delta);
+      else if (eRow === insertAt - 1 && sRow < insertAt) e.row = Math.max(1, eRow + delta);
+    }
+
+    return `${encodeCellRef(s)}:${encodeCellRef(e)}`;
+  };
+
+  const shiftSegment = (segment) => {
+    const reCell = /(\$?[A-Z]{1,3}\$?\d+)/g;
+    let out = "";
+    let i = 0;
+    while (i < segment.length) {
+      const m = reCell.exec(segment);
+      if (!m) {
+        out += segment.slice(i);
+        break;
+      }
+      const start = m.index;
+      const ref = m[1];
+      out += segment.slice(i, start);
+
+      const before = start > 0 ? segment[start - 1] : "";
+      const after = start + ref.length < segment.length ? segment[start + ref.length] : "";
+      if (before && /[A-Z0-9_.]/i.test(before)) {
+        out += ref;
+        i = start + ref.length;
+        continue;
+      }
+
+      if (after === ":") {
+        const m2 = reCell.exec(segment);
+        if (m2 && m2.index === start + ref.length + 1) {
+          const ref2 = m2[1];
+          out += adjustRangeForInsert(ref, ref2);
+          i = m2.index + ref2.length;
+          continue;
+        }
+        reCell.lastIndex = start + ref.length;
+      }
+
+      if (after && /[A-Z0-9_]/i.test(after)) {
+        out += ref;
+        i = start + ref.length;
+        continue;
+      }
+
+      const p = parseCellRef(ref);
+      if (!p) {
+        out += ref;
+        i = start + ref.length;
+        continue;
+      }
+      p.row = adjustRowForInsert(p.row, p.rowAbs, threshold, deltaRows, "shift");
+      out += encodeCellRef(p);
+      i = start + ref.length;
+    }
+    return out;
+  };
+
+  let out = "";
+  let inString = false;
+  let start = 0;
+  let i = 0;
+  while (i < formula.length) {
+    const ch = formula[i];
+    if (ch !== '"') {
+      i += 1;
+      continue;
+    }
+
+    if (!inString) {
+      out += shiftSegment(formula.slice(start, i));
+      inString = true;
+      start = i;
+      i += 1;
+      continue;
+    }
+
+    if (i + 1 < formula.length && formula[i + 1] === '"') {
+      i += 2;
+      continue;
+    }
+
+    i += 1;
+    out += formula.slice(start, i);
+    inString = false;
+    start = i;
+  }
+
+  const tail = formula.slice(start);
+  out += inString ? tail : shiftSegment(tail);
+  return out;
+}
+
+function updateWorksheetFormulasAfterRowChange(worksheet, thresholdRow1, deltaRows, skipStartRow1, skipRowCount) {
+  if (!worksheet) return;
+  if (!deltaRows) return;
+
+  const maxRow = Math.max(worksheet.rowCount || 0, worksheet.actualRowCount || 0);
+  const maxCol = Math.max(worksheet.columnCount || 0, worksheet.actualColumnCount || 0);
+
+  const skipStart = Number(skipStartRow1);
+  const skipEnd = Number.isFinite(skipStart) && skipRowCount ? skipStart + skipRowCount - 1 : null;
+
+  const getCellFormulaText = (ws, r1, c1, v) => {
+    if (!v || typeof v !== "object") return "";
+    if (v.formula) return String(v.formula);
+    if (!v.sharedFormula) return "";
+    const masterAddr = String(v.sharedFormula);
+    const masterPos = decodeCellAddr(masterAddr);
+    const masterCell = ws.getCell(masterAddr);
+    const masterVal = masterCell?.value;
+    const masterFormula = masterVal && typeof masterVal === "object" && masterVal.formula ? String(masterVal.formula) : "";
+    if (!masterFormula) return "";
+    if (!masterPos) return masterFormula;
+    const deltaR = r1 - masterPos.r;
+    const deltaC = c1 - masterPos.c;
+    return adjustFormulaByOffset(masterFormula, deltaR, deltaC);
+  };
+
+  for (let r = 1; r <= maxRow; r += 1) {
+    if (skipEnd !== null && r >= skipStart && r <= skipEnd) continue;
+    const row = worksheet.getRow(r);
+    for (let c = 1; c <= maxCol; c += 1) {
+      const cell = row.getCell(c);
+      const v = cell?.value;
+      if (!v || typeof v !== "object" || (!v.formula && !v.sharedFormula)) continue;
+      const baseFormula = getCellFormulaText(worksheet, r, c, v);
+      if (!baseFormula) continue;
+      const nextFormula = adjustFormulaByRowThreshold(baseFormula, thresholdRow1, deltaRows);
+      if (nextFormula === baseFormula) continue;
+      const nextValue = { ...v, formula: nextFormula };
+      if (nextValue.sharedFormula !== undefined) delete nextValue.sharedFormula;
+      cell.value = nextValue;
+    }
+  }
 }
 
 async function insertPurchaseRowsIntoTemplate({
@@ -889,26 +1456,117 @@ async function insertPurchaseRowsIntoTemplate({
   let maxAssignedCol = headerRowMinMax.maxCol;
   for (const p of mappingPairs) maxAssignedCol = Math.max(maxAssignedCol, p.contractCol);
 
-  const insertAtRow1 = contractHeaderRow.rowIndex + 1;
+  const baseDetailRow1 = contractHeaderRow.rowIndex + 1;
 
-  const styleSourceRow = templateWs.getRow(insertAtRow1);
+  const isManualContentCell = (cell) => {
+    if (!cell) return false;
+    const effectiveCell = cell.isMerged && cell.master ? cell.master : cell;
+    const v = effectiveCell.value;
+    if (v === null || v === undefined) return false;
+    if (typeof v === "object") {
+      if (v.formula !== undefined || v.sharedFormula !== undefined) return false;
+      return true;
+    }
+    return String(v).trim() !== "";
+  };
+
+  const hasManualContentInRow = (rowIndex1) => {
+    const row = templateWs.getRow(rowIndex1);
+    for (let c = originCol; c <= maxAssignedCol; c += 1) {
+      if (isManualContentCell(row.getCell(c))) return true;
+    }
+    return false;
+  };
+
+  const getInsertAtRow1 = () => {
+    if (!hasManualContentInRow(baseDetailRow1)) return baseDetailRow1;
+
+    const maxRow = Math.max(templateWs.rowCount || 0, templateWs.actualRowCount || 0) || baseDetailRow1;
+    const maxScan = Math.min(maxRow, baseDetailRow1 + 5000);
+
+    let lastContentRow1 = baseDetailRow1;
+    for (let r = baseDetailRow1; r <= maxScan; r += 1) {
+      const has = hasManualContentInRow(r);
+      if (has) {
+        lastContentRow1 = r;
+        continue;
+      }
+      return r;
+    }
+    return lastContentRow1 + 1;
+  };
+
+  const insertAtRow1 = getInsertAtRow1();
+
+  const styleSourceRowAtInsert = templateWs.getRow(insertAtRow1);
+  const styleSourceRowAtBase = templateWs.getRow(baseDetailRow1);
   const styleByCol = new Map();
   const formulaByCol = new Map();
   let fallbackStyle = null;
   
   for (let c = originCol; c <= maxAssignedCol; c += 1) {
-    const cell = styleSourceRow.getCell(c);
-    if (cell?.style && Object.keys(cell.style).length > 0) {
-      const s = deepClone(cell.style);
+    const cellAtInsert = styleSourceRowAtInsert.getCell(c);
+    const cellAtBase = styleSourceRowAtBase.getCell(c);
+    
+    // 选取样式的优先级：插入点行 > 标题下第一行
+    let pickedStyleCell = (cellAtInsert?.style && Object.keys(cellAtInsert.style).length > 0) ? cellAtInsert : cellAtBase;
+    
+    if (pickedStyleCell?.style && Object.keys(pickedStyleCell.style).length > 0) {
+      const s = deepClone(pickedStyleCell.style);
+      
+      // 优化边框逻辑：如果该列在明细区有边框，确保新生成的行拥有完整的上下边框
+      // 避免因为模板行只设置了上边框或下边框，导致新行之间没有分割线
+      if (s.border) {
+        const b = s.border;
+        if (b.top && !b.bottom) b.bottom = deepClone(b.top);
+        if (b.bottom && !b.top) b.top = deepClone(b.bottom);
+      }
+      
       styleByCol.set(c, s);
       if (!fallbackStyle) fallbackStyle = s;
     }
-    // 检查并记录公式
-    if (cell?.value && typeof cell.value === "object" && cell.value.formula) {
-      formulaByCol.set(c, cell.value.formula);
-    }
+    // ... 检查并记录公式 ...
+    const findFormulaTemplateInCol = () => {
+      const maxRow = Math.max(templateWs.rowCount || 0, templateWs.actualRowCount || 0) || baseDetailRow1;
+      const end = Math.min(maxRow, baseDetailRow1 + 60);
+      const preferred = [
+        { row1: insertAtRow1, cell: cellAtInsert },
+        { row1: baseDetailRow1, cell: cellAtBase },
+      ];
+      const tryCell = (row1, cell) => {
+        const v = cell?.value;
+        if (!v || typeof v !== "object") return null;
+        if (v.formula) return { formula: String(v.formula), sourceRow1: row1 };
+        if (!v.sharedFormula) return null;
+        const masterAddr = String(v.sharedFormula);
+        const masterPos = decodeCellAddr(masterAddr);
+        const masterCell = templateWs.getCell(masterAddr);
+        const masterVal = masterCell?.value;
+        const masterFormula =
+          masterVal && typeof masterVal === "object" && masterVal.formula ? String(masterVal.formula) : "";
+        if (!masterFormula) return null;
+        if (!masterPos) return { formula: masterFormula, sourceRow1: row1 };
+        const deltaR = row1 - masterPos.r;
+        const deltaC = c - masterPos.c;
+        return { formula: adjustFormulaByOffset(masterFormula, deltaR, deltaC), sourceRow1: row1 };
+      };
+
+      for (const p of preferred) {
+        const hit = tryCell(p.row1, p.cell);
+        if (hit) return hit;
+      }
+      for (let r = baseDetailRow1; r <= end; r += 1) {
+        const cell = templateWs.getRow(r).getCell(c);
+        const hit = tryCell(r, cell);
+        if (hit) return hit;
+      }
+      return null;
+    };
+
+    const tpl = findFormulaTemplateInCol();
+    if (tpl) formulaByCol.set(c, tpl);
   }
-  const rowHeight = styleSourceRow.height;
+  const rowHeight = styleSourceRowAtInsert.height ?? styleSourceRowAtBase.height;
 
   const insertRowValuesList = [];
   const maxPurchaseRow = Math.max(purchaseWs.rowCount || 0, purchaseWs.actualRowCount || 0);
@@ -929,68 +1587,145 @@ async function insertPurchaseRowsIntoTemplate({
   const originalMerges = getWorksheetMergeRanges(templateWs);
   const deltaRows = insertRowValuesList.length;
 
-  // 在插入前，探测标题行下方有多少行是“空白模板行”
-  // 逻辑：从标题行下一行开始，如果某行所有单元格要么为空，要么只有公式但没有手动输入的值，则视为模板行
   let blankTemplateRowsCount = 0;
-  const maxSearchRows = 50; // 最多向上探测50行，防止意外删除过多
-  for (let i = 0; i < maxSearchRows; i++) {
-    const checkRow = templateWs.getRow(insertAtRow1 + i);
-    let isBlank = true;
-    checkRow.eachCell({ includeEmpty: false }, (cell) => {
-      const val = cell.value;
-      // 如果单元格有值且不是公式对象（或者公式对象没有结果），则认为不是空白模板行
-      if (val !== null && val !== undefined) {
-        if (typeof val === 'object' && val.formula) {
-          // 仅有公式，继续检查其他格
-        } else if (String(val).trim() !== "") {
-          isBlank = false;
+  const maxSearchRows = 200;
+  const footerTextRe = /(合计|小计|总计|金额合计|总价|备注|说明|条款|结算|税)/;
+  const rowLooksLikePlaceholder = (rowIndex1) => {
+    const row = templateWs.getRow(rowIndex1);
+    let hasFooterText = false;
+    let hasNonFormulaData = false;
+
+    for (let c = originCol; c <= maxAssignedCol; c += 1) {
+      const cell = row.getCell(c);
+      if (!cell) continue;
+      const effectiveCell = cell.isMerged && cell.master ? cell.master : cell;
+      const val = effectiveCell.value;
+      if (val === null || val === undefined) continue;
+
+      if (typeof val === "object") {
+        if (val.formula !== undefined || val.sharedFormula !== undefined) continue;
+        const t = normalizeText(getCellText(effectiveCell));
+        if (t) {
+          if (footerTextRe.test(t)) hasFooterText = true;
+          else hasNonFormulaData = true;
         }
+        continue;
       }
-    });
-    if (isBlank && checkRow.actualCellCount >= 0) {
-      blankTemplateRowsCount++;
+
+      if (typeof val === "number") {
+        if (val !== 0) hasNonFormulaData = true;
+        continue;
+      }
+
+      const t = normalizeText(String(val));
+      if (t) {
+        if (footerTextRe.test(t)) hasFooterText = true;
+        else hasNonFormulaData = true;
+      }
+    }
+
+    if (hasFooterText) return false;
+    if (hasNonFormulaData) return false;
+    return true;
+  };
+
+  for (let i = 0; i < maxSearchRows; i += 1) {
+    const rowIndex1 = insertAtRow1 + i;
+    if (!rowLooksLikePlaceholder(rowIndex1)) break;
+    blankTemplateRowsCount += 1;
+  }
+
+  let netDelta = 0;
+  let thresholdRow1 = insertAtRow1;
+  let skipStartRow1 = insertAtRow1;
+  let skipRowCount = 0;
+  const newRowsNeedingFormula = new Set();
+  for (let i = 0; i < deltaRows; i += 1) newRowsNeedingFormula.add(insertAtRow1 + i);
+
+  if (blankTemplateRowsCount > 0) {
+    const extraCount = Math.max(0, deltaRows - blankTemplateRowsCount);
+    if (extraCount > 0) {
+      const extraInsertAtRow1 = insertAtRow1 + blankTemplateRowsCount;
+      const blank = new Array(maxAssignedCol).fill(null);
+      const blanks = [];
+      for (let i = 0; i < extraCount; i += 1) blanks.push(blank.slice());
+      templateWs.spliceRows(extraInsertAtRow1, 0, ...blanks);
+      netDelta = extraCount;
+      thresholdRow1 = extraInsertAtRow1;
+      skipStartRow1 = extraInsertAtRow1;
+      skipRowCount = extraCount;
     } else {
-      break;
+      netDelta = 0;
+      skipRowCount = 0;
+    }
+
+    for (let i = 0; i < deltaRows; i += 1) {
+      const rowNum = insertAtRow1 + i;
+      const row = templateWs.getRow(rowNum);
+      const values = insertRowValuesList[i];
+      if (!Array.isArray(values)) continue;
+      for (let c = originCol; c <= maxAssignedCol; c += 1) {
+        const v = values[c - 1];
+        if (v !== null && v !== undefined) row.getCell(c).value = v;
+      }
+    }
+  } else {
+    const blank = new Array(maxAssignedCol).fill(null);
+    const blanks = [];
+    for (let i = 0; i < deltaRows; i += 1) blanks.push(blank.slice());
+    templateWs.spliceRows(insertAtRow1, 0, ...blanks);
+    netDelta = deltaRows;
+    thresholdRow1 = insertAtRow1;
+    skipStartRow1 = insertAtRow1;
+    skipRowCount = deltaRows;
+
+    for (let i = 0; i < deltaRows; i += 1) {
+      const rowNum = insertAtRow1 + i;
+      const row = templateWs.getRow(rowNum);
+      const values = insertRowValuesList[i];
+      if (!Array.isArray(values)) continue;
+      for (let c = originCol; c <= maxAssignedCol; c += 1) {
+        const v = values[c - 1];
+        if (v !== null && v !== undefined) row.getCell(c).value = v;
+      }
     }
   }
-
-  // 执行插入
-  templateWs.spliceRows(insertAtRow1, 0, ...insertRowValuesList);
-
-  // 插入后，原来的空白模板行被挤到了下方位置：insertAtRow1 + deltaRows
-  // 删除这些多余的空白模板行
-  if (blankTemplateRowsCount > 0) {
-    templateWs.spliceRows(insertAtRow1 + deltaRows, blankTemplateRowsCount);
-  }
-
-  // 修正：计算净行数变化。
-  // 合并单元格的偏移应该基于 (插入行数 - 删除行数)
-  const netDelta = deltaRows - blankTemplateRowsCount;
 
   for (let i = 0; i < insertRowValuesList.length; i += 1) {
     const rowNum = insertAtRow1 + i;
     const row = templateWs.getRow(rowNum);
     if (rowHeight !== undefined) row.height = rowHeight;
-    
+
     for (let c = originCol; c <= maxAssignedCol; c += 1) {
       const cell = row.getCell(c);
-      
-      // 应用样式
+
       const style = styleByCol.get(c) ?? fallbackStyle;
       if (style) cell.style = deepClone(style);
-      
-      // 处理公式：如果模板该列原本有公式，则为新行生成对应的偏移公式
-      if (formulaByCol.has(c)) {
-        const baseFormula = formulaByCol.get(c);
-        // 这里 oldRow 使用 insertAtRow1，因为 baseFormula 是在 spliceRows 之前从该行提取的
-        const newFormula = adjustFormula(baseFormula, insertAtRow1, rowNum);
-        cell.value = { formula: newFormula };
-      }
+
+      const formulaEntry = formulaByCol.get(c);
+      if (!formulaEntry) continue;
+      const existing = cell?.value;
+      const hasExistingFormula =
+        existing && typeof existing === "object" && (existing.formula !== undefined || existing.sharedFormula !== undefined);
+      if (hasExistingFormula) continue;
+      if (newRowsNeedingFormula.size > 0 && !newRowsNeedingFormula.has(rowNum)) continue;
+      const newFormula = adjustFormula(formulaEntry.formula, formulaEntry.sourceRow1, rowNum);
+      cell.value = { formula: newFormula };
     }
   }
 
-  // 使用净变化 netDelta 来恢复合并单元格位置
-  restoreMergesAfterInsert(templateWs, originalMerges, insertAtRow1, netDelta);
+  if (netDelta) {
+    updateWorksheetFormulasAfterRowChange(templateWs, thresholdRow1, netDelta, skipStartRow1, skipRowCount);
+    restoreMergesAfterInsert(templateWs, originalMerges, thresholdRow1, netDelta);
+  }
+
+  const detailRowMergeSpans = getSingleRowHorizontalMergeSpansAtRow(
+    originalMerges,
+    baseDetailRow1,
+    originCol,
+    maxAssignedCol,
+  );
+  applyHorizontalMergeSpansToRows(templateWs, detailRowMergeSpans, insertAtRow1, insertRowValuesList.length);
 
   return {
     insertedRows: insertRowValuesList.length,
@@ -1003,7 +1738,13 @@ async function insertPurchaseRowsIntoTemplate({
 function refreshPreviewValues(container = previewEl) {
   if (!state.hf) return;
   if (!container) return;
-  const cells = container.querySelectorAll("td[data-row][data-col]");
+  refreshFormulaCells(container);
+}
+
+function refreshFormulaCells(container = previewEl) {
+  if (!state.hf) return;
+  if (!container) return;
+  const cells = container.querySelectorAll('td.formula-cell[data-row][data-col]');
   cells.forEach((td) => {
     const r = parseInt(td.dataset.row);
     const c = parseInt(td.dataset.col);
@@ -1013,6 +1754,54 @@ function refreshPreviewValues(container = previewEl) {
     if (displayValue) td.classList.remove("empty");
     else td.classList.add("empty");
   });
+}
+
+function buildMergeMapsByScan(ws, endRow, endCol) {
+  const keyOf = (r, c) => `${r},${c}`;
+  const mergeBounds = new Map();
+
+  for (let r = 1; r <= endRow; r += 1) {
+    const row = ws.getRow(r);
+    for (let c = 1; c <= endCol; c += 1) {
+      const cell = row.getCell(c);
+      if (!cell || !cell.isMerged) continue;
+      const master = cell.master;
+      if (!master || !master.address) continue;
+      const masterPos = decodeCellAddr(master.address);
+      if (!masterPos) continue;
+
+      const mk = keyOf(masterPos.r, masterPos.c);
+      const b = mergeBounds.get(mk) ?? { sR: masterPos.r, sC: masterPos.c, eR: masterPos.r, eC: masterPos.c };
+      if (r < b.sR) b.sR = r;
+      if (c < b.sC) b.sC = c;
+      if (r > b.eR) b.eR = r;
+      if (c > b.eC) b.eC = c;
+      mergeBounds.set(mk, b);
+    }
+  }
+
+  const mergeMaster = new Map();
+  const mergeSkip = new Set();
+
+  for (const b of mergeBounds.values()) {
+    const sR = Math.max(1, b.sR);
+    const sC = Math.max(1, b.sC);
+    const eR = Math.min(endRow, b.eR);
+    const eC = Math.min(endCol, b.eC);
+    const rr = eR - sR + 1;
+    const cc = eC - sC + 1;
+    if (rr <= 1 && cc <= 1) continue;
+
+    mergeMaster.set(keyOf(sR, sC), { rowSpan: rr, colSpan: cc });
+    for (let r = sR; r <= eR; r += 1) {
+      for (let c = sC; c <= eC; c += 1) {
+        if (r === sR && c === sC) continue;
+        mergeSkip.add(keyOf(r, c));
+      }
+    }
+  }
+
+  return { keyOf, mergeMaster, mergeSkip };
 }
 
 function renderPreviewInto(container, workbook, sheetName, options = {}) {
@@ -1025,34 +1814,21 @@ function renderPreviewInto(container, workbook, sheetName, options = {}) {
     container.textContent = "未找到工作表";
     return;
   }
+  if (useFormulaEngine && !state.hf && globalThis.HyperFormula) {
+    try {
+      initFormulaEngine(ws);
+    } catch {
+      state.hf = null;
+      state.hfSheetId = null;
+    }
+  }
 
   const maxRows = 60;
   const maxCols = 20;
   const endRow = Math.min(Math.max(ws.rowCount || 0, ws.actualRowCount || 0) || 1, maxRows);
   const endCol = Math.min(Math.max(ws.columnCount || 0, ws.actualColumnCount || 0) || 1, maxCols);
 
-  const keyOf = (r, c) => `${r},${c}`;
-  const mergeMaster = new Map();
-  const mergeSkip = new Set();
-  const merges = getWorksheetMergeRanges(ws);
-  for (const rng of merges) {
-    const decoded = decodeRangeAddr(rng);
-    if (!decoded) continue;
-    const s = decoded.s;
-    const e = decoded.e;
-    if (s.r < 1 || s.c < 1 || e.r < 1 || e.c < 1) continue;
-    if (s.r > endRow || s.c > endCol) continue;
-    const rr = Math.min(e.r, endRow) - s.r + 1;
-    const cc = Math.min(e.c, endCol) - s.c + 1;
-    if (rr <= 1 && cc <= 1) continue;
-    mergeMaster.set(keyOf(s.r, s.c), { rowSpan: rr, colSpan: cc });
-    for (let r = s.r; r <= Math.min(e.r, endRow); r += 1) {
-      for (let c = s.c; c <= Math.min(e.c, endCol); c += 1) {
-        if (r === s.r && c === s.c) continue;
-        mergeSkip.add(keyOf(r, c));
-      }
-    }
-  }
+  const { keyOf, mergeMaster, mergeSkip } = buildMergeMapsByScan(ws, endRow, endCol);
 
   const table = document.createElement("table");
   table.className = "table";
@@ -1097,7 +1873,10 @@ function renderPreviewInto(container, workbook, sheetName, options = {}) {
         td.dataset.col = c;
 
         const cell = row.getCell(c);
-        const isFormula = cell?.value && typeof cell.value === "object" && cell.value.formula;
+        const isFormula =
+          cell?.value &&
+          typeof cell.value === "object" &&
+          (cell.value.formula !== undefined || cell.value.sharedFormula !== undefined);
         
         if (isFormula) {
           td.contentEditable = "false";
@@ -1105,11 +1884,47 @@ function renderPreviewInto(container, workbook, sheetName, options = {}) {
           td.title = "公式单元格，无法手动修改";
         } else {
           td.contentEditable = "true";
+
+          let inputTimer = null;
+          const scheduleRecalc = (rowNum, colNum, value) => {
+            if (!useFormulaEngine) return;
+            if ((!state.hf || state.hfSheetId === null) && globalThis.HyperFormula) {
+              try {
+                initFormulaEngine(state.merged?.getWorksheet?.(state.mergedSheetName) ?? ws);
+              } catch {
+                state.hf = null;
+                state.hfSheetId = null;
+              }
+            }
+            if (!state.hf || state.hfSheetId === null) return;
+            try {
+              state.hf.setCellContents(
+                { sheet: state.hfSheetId, row: rowNum - 1, col: colNum - 1 },
+                [[value]],
+              );
+            } catch (e) {
+              return;
+            }
+            if (inputTimer) clearTimeout(inputTimer);
+            inputTimer = setTimeout(() => refreshFormulaCells(container), 80);
+          };
+
+          td.addEventListener("input", (e) => {
+            const rowNum = parseInt(e.target.dataset.row);
+            const colNum = parseInt(e.target.dataset.col);
+            const raw = String(e.target.innerText ?? "").replace(/\r\n/g, "\n");
+            const trimmed = raw.trim();
+            let v = trimmed;
+            const num = Number(trimmed);
+            if (trimmed !== "" && !Number.isNaN(num)) v = num;
+            scheduleRecalc(rowNum, colNum, v);
+          });
           
           td.addEventListener("blur", (e) => {
             const rowNum = parseInt(e.target.dataset.row);
             const colNum = parseInt(e.target.dataset.col);
-            const newValue = e.target.innerText.trim();
+            const raw = String(e.target.innerText ?? "").replace(/\r\n/g, "\n");
+            const newValue = raw.trim();
             
             const targetSheet = state.merged.getWorksheet(state.mergedSheetName);
             if (targetSheet) {
@@ -1119,8 +1934,8 @@ function renderPreviewInto(container, workbook, sheetName, options = {}) {
               if (newValue !== "" && !isNaN(num)) {
                 cell.value = num;
               } else {
-                cell.value = newValue;
-                if (newValue.includes("\n")) {
+                cell.value = raw;
+                if (raw.includes("\n")) {
                   cell.alignment = { wrapText: true };
                 }
               }
@@ -1132,7 +1947,7 @@ function renderPreviewInto(container, workbook, sheetName, options = {}) {
                   col: colNum - 1
                 }, [[cell.value]]);
                 
-                refreshPreviewValues(container);
+                refreshFormulaCells(container);
               }
             }
           });
@@ -1168,7 +1983,8 @@ function renderPreviewInto(container, workbook, sheetName, options = {}) {
         td.contentEditable = "false";
       }
 
-      if (!displayValue) td.className = "empty";
+      if (!displayValue) td.classList.add("empty");
+      else td.classList.remove("empty");
       tr.appendChild(td);
     }
     tbody.appendChild(tr);
@@ -1184,7 +2000,9 @@ function renderPreview(workbook, sheetName) {
 }
 
 function enableActionsIfReady() {
-  const ready = !!(state.template?.workbook && state.purchase?.workbook);
+  const purchaseTypeId = String(state.purchase?.typeId ?? "").trim();
+  const templateReady = !!(state.template?.workbook || isWordLikeTemplate(state.template?.fileType));
+  const ready = !!(templateReady && state.purchase?.workbook && purchaseTypeId);
   mergeBtnEl.disabled = !ready;
 }
 
@@ -1219,24 +2037,33 @@ function sanitizeFilenamePart(input) {
 }
 
 function computeDefaultOutputBaseName() {
-  const templateNameRaw = state.template?.file?.name?.replace(/\.(xlsx|xls)$/i, "") || "合同模板";
+  const templateNameRaw = state.template?.file?.name?.replace(/\.[A-Za-z0-9]+$/i, "") || "合同模板";
   const templateName = sanitizeFilenamePart(templateNameRaw) || "合同模板";
-  const purchaseNoRaw = state.merged ? getPurchaseOrderNoFromTemplate(state.merged, state.mergedSheetName) : "";
-  const purchaseNo = sanitizeFilenamePart(purchaseNoRaw);
-  return purchaseNo ? `${templateName}_${purchaseNo}` : `${templateName}_已插入订购单`;
+  const purchaseNameRaw = state.purchase?.file?.name?.replace(/\.(xlsx|xls)$/i, "") || "";
+  const purchaseName = sanitizeFilenamePart(purchaseNameRaw);
+  return purchaseName ? `${templateName}-${purchaseName}` : `${templateName}-已插入订购单`;
 }
 
-function ensureXlsxFilename(name) {
+function ensureFilenameWithExt(name, extWithDot) {
+  const ext = String(extWithDot ?? "").trim();
   const s = String(name ?? "").trim();
-  if (!s) return "合同.xlsx";
-  if (/\.xlsx$/i.test(s)) return s;
-  return `${s}.xlsx`;
+  if (!s) return `合同${ext || ".xlsx"}`;
+  if (ext && new RegExp(`\\${ext}$`, "i").test(s)) return s;
+  const stripped = s.replace(/\.[A-Za-z0-9]+$/i, "");
+  return `${stripped}${ext || ".xlsx"}`;
+}
+
+function getActiveOutputExtWithDot() {
+  if (state.mergedDocxBuffer) return ".docx";
+  const t = String(state.template?.fileType ?? "").toLowerCase();
+  if (t.includes("docx") || (t.includes("doc") && !t.includes("docx"))) return ".docx";
+  return ".xlsx";
 }
 
 function getEffectiveOutputFilename() {
   const typed = sanitizeFilenamePart(saveNameInputEl?.value);
-  const base = typed ? typed.replace(/\.xlsx$/i, "") : computeDefaultOutputBaseName();
-  return ensureXlsxFilename(base);
+  const base = typed ? typed.replace(/\.[A-Za-z0-9]+$/i, "") : computeDefaultOutputBaseName();
+  return ensureFilenameWithExt(base, getActiveOutputExtWithDot());
 }
 
 function formatDateTime(value) {
@@ -1250,8 +2077,13 @@ function formatDateTime(value) {
 }
 
 function downloadArrayBuffer(arrayBuffer, filename) {
+  const ext = String(filename ?? "").trim().toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] ?? "";
+  const type =
+    ext === "docx"
+      ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
   const blob = new Blob([arrayBuffer], {
-    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    type,
   });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -1277,6 +2109,7 @@ function renderContractsTable(list) {
   rows.forEach((row, idx) => {
     const tr = document.createElement("tr");
     const name = row?.name ?? "";
+    const filePath = row?.file_path ?? "";
     const createdAt = formatDateTime(row?.created_at);
     const id = String(row?.id ?? "");
     tr.innerHTML = `
@@ -1285,9 +2118,15 @@ function renderContractsTable(list) {
       <td>${createdAt}</td>
       <td>
         <div class="opBtns">
-          <button class="miniBtn" data-action="preview" data-id="${id}" data-name="${String(name)}">预览</button>
-          <button class="miniBtn primary" data-action="download" data-id="${id}" data-name="${String(name)}">下载</button>
-          <button class="miniBtn danger" data-action="delete" data-id="${id}" data-name="${String(name)}">删除</button>
+          <button class="miniBtn" data-action="preview" data-id="${id}" data-name="${String(name)}" data-file-path="${String(
+            filePath,
+          )}">预览</button>
+          <button class="miniBtn primary" data-action="download" data-id="${id}" data-name="${String(name)}" data-file-path="${String(
+            filePath,
+          )}">下载</button>
+          <button class="miniBtn danger" data-action="delete" data-id="${id}" data-name="${String(name)}" data-file-path="${String(
+            filePath,
+          )}">删除</button>
         </div>
       </td>
     `;
@@ -1325,7 +2164,10 @@ function closePreviewModal() {
   modalState.workbook = null;
   modalState.sheetName = null;
   if (modalTitleEl) modalTitleEl.textContent = "预览";
-  if (modalSheetSelectEl) modalSheetSelectEl.innerHTML = "";
+  if (modalSheetSelectEl) {
+    modalSheetSelectEl.innerHTML = "";
+    modalSheetSelectEl.style.display = "";
+  }
   if (modalPreviewEl) modalPreviewEl.innerHTML = "";
 }
 
@@ -1336,6 +2178,7 @@ function openPreviewModal(title, workbook) {
   if (modalTitleEl) modalTitleEl.textContent = modalState.title;
 
   if (modalSheetSelectEl) {
+    modalSheetSelectEl.style.display = "";
     modalSheetSelectEl.innerHTML = "";
     const sheets = Array.isArray(workbook?.worksheets) ? workbook.worksheets : [];
     for (const ws of sheets) {
@@ -1358,6 +2201,94 @@ function openPreviewModal(title, workbook) {
 
   previewModalEl.classList.add("open");
   previewModalEl.setAttribute("aria-hidden", "false");
+}
+
+function ensureDocxPreview() {
+  const loadScript = (url, dataAttrKey, timeoutMs = 12000) =>
+    new Promise((resolve, reject) => {
+      const existing = document.querySelector(`script[${dataAttrKey}="${url}"]`);
+      if (existing) {
+        existing.addEventListener("load", () => resolve(), { once: true });
+        existing.addEventListener("error", () => reject(new Error(`加载失败：${url}`)), { once: true });
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = url;
+      script.async = true;
+      script.setAttribute(dataAttrKey, url);
+
+      const timer = setTimeout(() => {
+        try {
+          script.remove();
+        } catch {}
+        reject(new Error(`加载超时：${url}`));
+      }, timeoutMs);
+
+      script.onload = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      script.onerror = () => {
+        clearTimeout(timer);
+        reject(new Error(`加载失败：${url}`));
+      };
+      document.head.appendChild(script);
+    });
+
+  const ensureJsZip = async () => {
+    if (globalThis.JSZip) return;
+    const urls = [
+      "https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js",
+      "https://unpkg.com/jszip@3.10.1/dist/jszip.min.js",
+    ];
+    let lastErr = null;
+    for (const url of urls) {
+      try {
+        await loadScript(url, "data-jszip-src");
+        if (globalThis.JSZip) return;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("JSZip 加载失败");
+  };
+
+  return (async () => {
+    if (globalThis.docx?.renderAsync) return;
+    await ensureJsZip();
+
+    const urls = [
+      "https://cdn.jsdelivr.net/npm/docx-preview-lib@0.1.14-fix-3/dist/docx-preview.min.js",
+      "https://unpkg.com/docx-preview-lib@0.1.14-fix-3/dist/docx-preview.min.js",
+    ];
+    let lastErr = null;
+    for (const url of urls) {
+      try {
+        await loadScript(url, "data-docx-preview-src");
+        if (globalThis.docx?.renderAsync) return;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("docx-preview 加载失败");
+  })();
+}
+
+async function openDocxPreviewModal(title, arrayBuffer) {
+  if (!previewModalEl || !modalPreviewEl) return;
+  modalState.workbook = null;
+  modalState.sheetName = null;
+  modalState.title = String(title || "预览");
+  if (modalTitleEl) modalTitleEl.textContent = modalState.title;
+  if (modalSheetSelectEl) {
+    modalSheetSelectEl.innerHTML = "";
+    modalSheetSelectEl.style.display = "none";
+  }
+  modalPreviewEl.innerHTML = "";
+  previewModalEl.classList.add("open");
+  previewModalEl.setAttribute("aria-hidden", "false");
+
+  await renderDocxWithoutImages(arrayBuffer, modalPreviewEl, { editable: false });
 }
 
 if (modalCloseEl) modalCloseEl.addEventListener("click", closePreviewModal);
@@ -1473,14 +2404,171 @@ async function cloneWorkbook(workbook) {
   return clone;
 }
 
-async function mergeToNewWorkbook() {
-  if (!state.template?.workbook || !state.purchase?.workbook) return;
-  const templateSheetName = templateSheetEl.value;
-  const purchaseSheetName = purchaseSheetEl.value;
+function coerceToArrayMaybeJson(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return null;
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {}
+    const parts = s.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
+    return parts.length > 0 ? parts : null;
+  }
+  return null;
+}
+
+async function mergeToDocxContract() {
   const templateId = String(state.template?.id ?? templateSelectEl?.value ?? "");
   const purchaseTypeId = String(state.purchase?.typeId ?? "");
   if (!templateId) throw new Error("缺少模板 ID");
   if (!purchaseTypeId) throw new Error("缺少订购单类型标识（type_ID）");
+  if (!state.purchase?.workbook) throw new Error("订购单未就绪");
+
+  const purchaseSheetName = purchaseSheetEl.value;
+  const purchaseWs = getWorksheet(state.purchase.workbook, purchaseSheetName);
+  if (!purchaseWs) throw new Error("订购单工作表不存在");
+
+  setStatus("正在读取映射关系…");
+  const mappingOut = await fetchJsonWithFallback(
+    `/api/mapping?template_id=${encodeURIComponent(templateId)}&purchase_type_id=${encodeURIComponent(purchaseTypeId)}`,
+  );
+  if (!mappingOut.res.ok || !mappingOut.json?.success) {
+    const msg = mappingOut.json?.error || `${mappingOut.res.status} ${mappingOut.res.statusText}`;
+    throw new Error(`映射关系读取失败：${msg}`);
+  }
+  const mapping = mappingOut.json.data;
+
+  const contractHeaders =
+    coerceToArrayMaybeJson(mapping?.config?.contract_headers) ??
+    coerceToArrayMaybeJson(mapping?.contract_headers);
+  const purchaseHeaders =
+    coerceToArrayMaybeJson(mapping?.config?.purchase_headers) ??
+    coerceToArrayMaybeJson(mapping?.purchase_headers);
+  const rules = Array.isArray(mapping?.rules) ? mapping.rules : null;
+
+  if (!contractHeaders || contractHeaders.length === 0) throw new Error("映射配置缺少 contract_headers");
+  if (!purchaseHeaders || purchaseHeaders.length === 0) throw new Error("映射配置缺少 purchase_headers");
+  if (!rules || rules.length === 0) throw new Error("映射规则为空");
+
+  const purchaseHeaderRow = findHeaderRowInWorksheet(purchaseWs, purchaseHeaders);
+  if (!purchaseHeaderRow) throw new Error("未在订购单中找到映射配置指定的标题行");
+
+  const contractHeaderIndex = new Map();
+  contractHeaders.forEach((h, idx) => {
+    const k = normalizeText(h);
+    if (k) contractHeaderIndex.set(k, idx);
+  });
+
+  const mappingPairs = [];
+  for (const r of rules) {
+    const contractHeader = normalizeText(r?.contract_header);
+    const purchaseHeader = normalizeText(r?.purchase_header);
+    if (!contractHeader || !purchaseHeader) continue;
+    const purchaseCol = purchaseHeaderRow.headerToCol.get(purchaseHeader);
+    const contractIdx = contractHeaderIndex.get(contractHeader);
+    if (!purchaseCol && purchaseCol !== 0) continue;
+    if (contractIdx === undefined) continue;
+    mappingPairs.push({ contractIdx, purchaseCol });
+  }
+  if (mappingPairs.length === 0) throw new Error("映射规则未能匹配到任何字段");
+
+  const maxPurchaseRow = Math.max(purchaseWs.rowCount || 0, purchaseWs.actualRowCount || 0);
+  const rows = [];
+  for (let r = purchaseHeaderRow.rowIndex + 1; r <= maxPurchaseRow; r += 1) {
+    const row = purchaseWs.getRow(r);
+    const arr = new Array(contractHeaders.length).fill("");
+    let any = false;
+    for (const p of mappingPairs) {
+      const cell = row.getCell(p.purchaseCol);
+      const text = normalizeText(getCellText(cell));
+      if (text) any = true;
+      arr[p.contractIdx] = text;
+    }
+    if (any) rows.push(arr);
+  }
+  if (rows.length === 0) throw new Error("订购单没有可插入的数据行");
+
+  setStatus("正在生成 Word 合同…");
+  const outputBaseName = computeDefaultOutputBaseName();
+  let templateDocxBase64 = "";
+  try {
+    if (state.template?.buffer && previewEl?.dataset?.docxEditable) {
+      const editedTpl = await applyDocxEditsToArrayBuffer(state.template.buffer, previewEl);
+      const bytes = new Uint8Array(editedTpl);
+      let binary = "";
+      const chunkSize = 0x2000;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+      }
+      templateDocxBase64 = btoa(binary);
+    }
+  } catch {}
+  const res = await fetchWithLocalFallbackRequest(`/api/templates/${encodeURIComponent(templateId)}/merge-docx`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      output_base_name: outputBaseName,
+      contract_headers: contractHeaders,
+      rows,
+      template_docx_base64: templateDocxBase64 || undefined,
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    const parsed = (() => {
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    })();
+    const msg = parsed?.error || parsed?.message || text || `${res.status} ${res.statusText}`;
+    throw new Error(`生成失败：${msg}`);
+  }
+
+  const buffer = await res.arrayBuffer();
+  state.merged = null;
+  state.mergedSheetName = null;
+  state.mergedDocxBuffer = buffer;
+  state.mergedDocxFilename = ensureFilenameWithExt(outputBaseName, ".docx");
+
+  downloadBtnEl.disabled = false;
+  if (saveBtnEl) saveBtnEl.disabled = false;
+  if (saveNameInputEl) {
+    saveNameInputEl.disabled = false;
+    saveNameInputEl.value = state.mergedDocxFilename;
+  }
+  previewEl.innerHTML = '<div class="meta">正在渲染生成后的 DOCX，请稍候…</div>';
+  try {
+    await renderDocxWithoutImages(buffer, previewEl, { editable: false });
+  } catch (err) {
+    previewEl.innerHTML = `<div class="meta">DOCX 预览失败：${String(
+      err?.message ?? err,
+    )}。请点击“下载修改后文件”查看结果。</div>`;
+  }
+  setStatus(`已生成 Word 合同：共插入 ${rows.length} 行`);
+}
+
+async function mergeToNewWorkbook() {
+  const templateId = String(state.template?.id ?? templateSelectEl?.value ?? "");
+  const purchaseTypeId = String(state.purchase?.typeId ?? "");
+  if (!templateId) throw new Error("缺少模板 ID");
+  if (!purchaseTypeId) throw new Error("缺少订购单类型标识（type_ID）");
+  if (!state.purchase?.workbook) return;
+
+  const isWord = isWordLikeTemplate(state.template?.fileType);
+  if (isWord) {
+    await mergeToDocxContract();
+    return;
+  }
+
+  if (!state.template?.workbook) return;
+  commitActivePreviewCellEdits();
+  const templateSheetName = templateSheetEl.value;
+  const purchaseSheetName = purchaseSheetEl.value;
 
   // 使用当前在预览中（可能已编辑）的模板作为源进行克隆
   setStatus("正在准备合并环境…");
@@ -1521,7 +2609,7 @@ async function mergeToNewWorkbook() {
   if (saveBtnEl) saveBtnEl.disabled = false;
   if (saveNameInputEl) {
     saveNameInputEl.disabled = false;
-    saveNameInputEl.value = ensureXlsxFilename(computeDefaultOutputBaseName());
+    saveNameInputEl.value = ensureFilenameWithExt(computeDefaultOutputBaseName(), ".xlsx");
   }
   renderPreview(templateClone, templateSheetName);
   setStatus(
@@ -1530,21 +2618,37 @@ async function mergeToNewWorkbook() {
 }
 
 async function handleDownload() {
-  if (!state.merged) return;
+  commitActivePreviewCellEdits();
   const filename = getEffectiveOutputFilename();
+  if (state.mergedDocxBuffer) {
+    const out = await applyDocxEditsToArrayBuffer(state.mergedDocxBuffer, previewEl).catch(() => state.mergedDocxBuffer);
+    state.mergedDocxBuffer = out;
+    downloadArrayBuffer(out, filename);
+    return;
+  }
+  if (!state.merged) return;
   await downloadWorkbook(state.merged, filename);
 }
 
 async function handleSaveToServer() {
-  if (!state.merged) return;
+  commitActivePreviewCellEdits();
   const filename = getEffectiveOutputFilename();
-  const baseName = filename.replace(/\.xlsx$/i, "");
+  const baseName = filename.replace(/\.[A-Za-z0-9]+$/i, "");
 
   try {
     setStatus("正在保存到服务器…");
-    const out = await state.merged.xlsx.writeBuffer();
-    const pathname = `/api/contracts/save?name=${encodeURIComponent(baseName)}`;
-    const res = await postBinaryWithFallback(pathname, out);
+    let res = null;
+    if (state.mergedDocxBuffer) {
+      const out = await applyDocxEditsToArrayBuffer(state.mergedDocxBuffer, previewEl).catch(() => state.mergedDocxBuffer);
+      state.mergedDocxBuffer = out;
+      const pathname = `/api/contracts/save?name=${encodeURIComponent(baseName)}&ext=docx`;
+      res = await postBinaryWithFallback(pathname, out);
+    } else {
+      if (!state.merged) return;
+      const out = await state.merged.xlsx.writeBuffer();
+      const pathname = `/api/contracts/save?name=${encodeURIComponent(baseName)}&ext=xlsx`;
+      res = await postBinaryWithFallback(pathname, out);
+    }
     let json = null;
     try {
       json = await res.json();
@@ -1561,11 +2665,13 @@ async function handleSaveToServer() {
 }
 
 templateSelectEl.addEventListener("change", handleTemplateSelectChange);
-if (purchaseSelectEl) purchaseSelectEl.addEventListener("change", handlePurchaseSelectChange);
+if (purchaseFileEl) purchaseFileEl.addEventListener("change", handlePurchaseFileChange);
 mergeBtnEl.addEventListener("click", () => {
   mergeToNewWorkbook().catch((e) => {
     state.merged = null;
     state.mergedSheetName = null;
+    state.mergedDocxBuffer = null;
+    state.mergedDocxFilename = null;
     downloadBtnEl.disabled = true;
     if (saveBtnEl) saveBtnEl.disabled = true;
     if (saveNameInputEl) {
@@ -1584,7 +2690,10 @@ if (contractsTbodyEl) {
     const action = btn.dataset.action;
     const id = btn.dataset.id;
     const name = btn.dataset.name || "";
+    const filePath = btn.dataset.filePath || "";
     if (!id) return;
+    const ext = String(filePath).toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] ?? "";
+    const extWithDot = ext ? `.${ext}` : ".xlsx";
 
     if (action === "download") {
       (async () => {
@@ -1603,7 +2712,7 @@ if (contractsTbodyEl) {
             throw new Error(msg);
           }
           const buffer = await response.arrayBuffer();
-          const filename = ensureXlsxFilename(sanitizeFilenamePart(name) || `contract_${id}`);
+          const filename = ensureFilenameWithExt(sanitizeFilenamePart(name) || `contract_${id}`, extWithDot);
           downloadArrayBuffer(buffer, filename);
         } catch (e) {
           setStatus(`下载失败：${e?.message ?? e}`);
@@ -1630,6 +2739,17 @@ if (contractsTbodyEl) {
             throw new Error(msg);
           }
           const buffer = await response.arrayBuffer();
+          if (extWithDot.toLowerCase() === ".docx") {
+            await openDocxPreviewModal(`预览 - ${name || id}`, buffer);
+            setStatus("");
+            return;
+          }
+          if (extWithDot.toLowerCase() !== ".xlsx") {
+            const filename = ensureFilenameWithExt(sanitizeFilenamePart(name) || `contract_${id}`, extWithDot);
+            downloadArrayBuffer(buffer, filename);
+            setStatus("");
+            return;
+          }
           const wb = await loadWorkbookFromArrayBuffer(buffer);
           openPreviewModal(`预览 - ${name || id}`, wb);
           setStatus("");
@@ -1691,9 +2811,8 @@ templateSheetEl.addEventListener("change", async () => {
 });
 
 purchaseSheetEl.addEventListener("change", () => {
-  // 修改采购单工作表仅清除合并后的下载状态，但不清空模板预览
-  state.merged = state.template?.workbook || null;
-  state.mergedSheetName = templateSheetEl.value;
+  state.mergedDocxBuffer = null;
+  state.mergedDocxFilename = null;
   downloadBtnEl.disabled = true;
   if (saveBtnEl) saveBtnEl.disabled = true;
   if (saveNameInputEl) {
@@ -1701,22 +2820,6 @@ purchaseSheetEl.addEventListener("change", () => {
     saveNameInputEl.value = "";
   }
   setStatus("");
-  
-  if (state.merged && state.mergedSheetName) {
-    (async () => {
-      try {
-        await ensureHyperFormula();
-        initFormulaEngine(state.merged.getWorksheet(state.mergedSheetName));
-      } catch (e) {
-        try {
-          if (state.hf) state.hf.destroy();
-        } catch {}
-        state.hf = null;
-        state.hfSheetId = null;
-      }
-      renderPreview(state.merged, state.mergedSheetName);
-    })();
-  }
 });
 
 // 初始化：获取模板列表

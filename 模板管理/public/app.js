@@ -116,6 +116,18 @@ async function renderExcelPreview(arrayBuffer) {
     return '<div class="meta">Excel 预览组件未加载，请刷新页面重试。</div>';
   }
 
+  const columnToLetters = (n) => {
+    let x = Number(n) || 0;
+    if (x < 1) return '';
+    let s = '';
+    while (x > 0) {
+      x -= 1;
+      s = String.fromCharCode(65 + (x % 26)) + s;
+      x = Math.floor(x / 26);
+    }
+    return s;
+  };
+
   const workbook = new window.ExcelJS.Workbook();
   try {
     await workbook.xlsx.load(new Uint8Array(arrayBuffer));
@@ -156,7 +168,7 @@ async function renderExcelPreview(arrayBuffer) {
 
   let html = '<div class="previewBox"><table class="previewTable"><thead><tr><th></th>';
   for (let c = 1; c <= maxCols; c++) {
-    html += `<th>${escapeHtml(String(c))}</th>`;
+    html += `<th>${escapeHtml(columnToLetters(c))}</th>`;
   }
   html += '</tr></thead><tbody>';
   for (let r = 1; r <= maxRows; r++) {
@@ -390,37 +402,57 @@ function mergeAutoMatchedRules(existingRules, templateHeaders, purchaseHeaders) 
   return out;
 }
 
-function applyHeaderRowSelection({ keepExistingRules }) {
-  if (!mappingTemplateSheet || !mappingPurchaseSheet) throw new Error('请先解析标题');
+function setMappingHeaders({ templateHeaders, purchaseHeaders, templateRow, purchaseRow, keepExistingRules }) {
+  const t = Array.isArray(templateHeaders) ? templateHeaders : [];
+  const p = Array.isArray(purchaseHeaders) ? purchaseHeaders : [];
+  if (!t.length) throw new Error('合同模板标题行为空');
+  if (!p.length) throw new Error('订购单标题行为空');
 
-  const templateInput = $('mappingTemplateHeaderRowInput');
-  const purchaseInput = $('mappingPurchaseHeaderRowInput');
+  mappingTemplateHeaderRow = templateRow ?? 1;
+  mappingPurchaseHeaderRow = purchaseRow ?? 1;
+  mappingTemplateHeaders = t;
+  mappingPurchaseHeaders = p;
 
-  const templateRow = readPositiveInt(templateInput?.value) ?? mappingTemplateHeaderRow ?? 1;
-  const purchaseRow = readPositiveInt(purchaseInput?.value) ?? mappingPurchaseHeaderRow ?? 1;
-
-  const templateMax = mappingTemplateSheet.rowCount || templateRow;
-  const purchaseMax = mappingPurchaseSheet.rowCount || purchaseRow;
-  if (templateRow > templateMax) throw new Error(`合同模板标题行超出范围（最大 ${templateMax}）`);
-  if (purchaseRow > purchaseMax) throw new Error(`订购单标题行超出范围（最大 ${purchaseMax}）`);
-
-  const newTemplateHeaders = extractHeadersFromRow(mappingTemplateSheet, templateRow);
-  const newPurchaseHeaders = extractHeadersFromRow(mappingPurchaseSheet, purchaseRow);
-  if (!newTemplateHeaders.length) throw new Error('合同模板标题行为空');
-  if (!newPurchaseHeaders.length) throw new Error('订购单标题行为空');
-
-  mappingTemplateHeaderRow = templateRow;
-  mappingPurchaseHeaderRow = purchaseRow;
-  mappingTemplateHeaders = newTemplateHeaders;
-  mappingPurchaseHeaders = newPurchaseHeaders;
-
-  setHeaderRowUi(templateRow, purchaseRow);
+  setHeaderRowUi(mappingTemplateHeaderRow, mappingPurchaseHeaderRow);
   renderChips($('templateHeadersBox'), mappingTemplateHeaders);
   renderChips($('purchaseHeadersBox'), mappingPurchaseHeaders);
 
   mappingRules = mergeAutoMatchedRules(keepExistingRules ? mappingRules : [], mappingTemplateHeaders, mappingPurchaseHeaders);
   renderMappingRulesTable();
   return mappingRules.length ? mappingRules.length - 1 : 0;
+}
+
+function applyHeaderRowSelection({ keepExistingRules }) {
+  const templateInput = $('mappingTemplateHeaderRowInput');
+  const purchaseInput = $('mappingPurchaseHeaderRowInput');
+
+  const templateRow = readPositiveInt(templateInput?.value) ?? mappingTemplateHeaderRow ?? 1;
+  const purchaseRow = readPositiveInt(purchaseInput?.value) ?? mappingPurchaseHeaderRow ?? 1;
+
+  let newTemplateHeaders = mappingTemplateHeaders;
+  let newPurchaseHeaders = mappingPurchaseHeaders;
+
+  if (mappingTemplateSheet) {
+    const templateMax = mappingTemplateSheet.rowCount || templateRow;
+    if (templateRow > templateMax) throw new Error(`合同模板标题行超出范围（最大 ${templateMax}）`);
+    newTemplateHeaders = extractHeadersFromRow(mappingTemplateSheet, templateRow);
+  }
+  if (mappingPurchaseSheet) {
+    const purchaseMax = mappingPurchaseSheet.rowCount || purchaseRow;
+    if (purchaseRow > purchaseMax) throw new Error(`订购单标题行超出范围（最大 ${purchaseMax}）`);
+    newPurchaseHeaders = extractHeadersFromRow(mappingPurchaseSheet, purchaseRow);
+  }
+
+  if (!newTemplateHeaders || !newTemplateHeaders.length) throw new Error('请先解析标题');
+  if (!newPurchaseHeaders || !newPurchaseHeaders.length) throw new Error('请先解析标题');
+
+  return setMappingHeaders({
+    templateHeaders: newTemplateHeaders,
+    purchaseHeaders: newPurchaseHeaders,
+    templateRow,
+    purchaseRow,
+    keepExistingRules
+  });
 }
 
 function resetMappingParsedState() {
@@ -434,8 +466,14 @@ function resetMappingParsedState() {
   setHeaderRowUi(null, null);
   const templateSelect = $('mappingTemplateHeaderRowInput');
   const purchaseSelect = $('mappingPurchaseHeaderRowInput');
-  if (templateSelect) templateSelect.innerHTML = '';
-  if (purchaseSelect) purchaseSelect.innerHTML = '';
+  if (templateSelect) {
+    templateSelect.innerHTML = '';
+    templateSelect.disabled = false;
+  }
+  if (purchaseSelect) {
+    purchaseSelect.innerHTML = '';
+    purchaseSelect.disabled = false;
+  }
   const tbox = $('templateHeadersBox');
   const pbox = $('purchaseHeadersBox');
   if (tbox) tbox.innerHTML = '';
@@ -459,6 +497,35 @@ async function previewRecord(kind, row) {
       const arrayBuffer = await blob.arrayBuffer();
       const html = await renderExcelPreview(arrayBuffer);
       $('previewBody').innerHTML = html;
+      return;
+    }
+
+    if (ext === 'docx') {
+      const { data } = await apiJson(`/api/${kind}/${encodeURIComponent(id)}/preview`);
+      const blocks = data?.blocks || [];
+      const parts = [];
+      for (const b of blocks) {
+        if (b?.type === 'p') {
+          const t = String(b.text ?? '').trim();
+          if (!t) continue;
+          parts.push(`<div class="docxText">${escapeHtml(t)}</div>`);
+          continue;
+        }
+        if (b?.type === 'table' && Array.isArray(b.rows) && b.rows.length) {
+          const rows = b.rows;
+          const head = rows[0] || [];
+          const bodyRows = rows.slice(1);
+          const thead =
+            head.length > 0
+              ? `<thead><tr>${head.map((c) => `<th>${escapeHtml(String(c ?? ''))}</th>`).join('')}</tr></thead>`
+              : '';
+          const tbody = `<tbody>${bodyRows
+            .map((r) => `<tr>${(r || []).map((c) => `<td>${escapeHtml(String(c ?? ''))}</td>`).join('')}</tr>`)
+            .join('')}</tbody>`;
+          parts.push(`<div class="previewBox"><table class="previewTable">${thead}${tbody}</table></div>`);
+        }
+      }
+      $('previewBody').innerHTML = parts.join('') || '<div class="meta">未解析到可预览内容</div>';
       return;
     }
 
@@ -658,39 +725,71 @@ async function parseMappingHeaders() {
       return;
     }
 
-    const templateSheet = await loadXlsxSheetFromDownload(`/api/templates/${encodeURIComponent(templateId)}/download`);
-    const purchaseSheet = await loadXlsxSheetFromDownload(
-      `/api/purchase-orders/${encodeURIComponent(purchaseId)}/download`
-    );
+    const templateRecord = (templatesCache || []).find((r) => String(r?.id ?? '') === String(templateId));
+    const purchaseRecord = (purchaseOrdersCache || []).find((r) => String(r?.id ?? '') === String(purchaseId));
+    const detectTypeFromRecord = (r) =>
+      normalizeType(r?.file_type || extFromName(r?.file_name) || extFromName(r?.file_path) || extFromName(r?.name));
 
-    mappingTemplateSheet = templateSheet;
-    mappingPurchaseSheet = purchaseSheet;
+    const templateType = detectTypeFromRecord(templateRecord);
+    const purchaseType = detectTypeFromRecord(purchaseRecord);
 
-    const detectedTemplateRow = detectTemplateHeaderRow(templateSheet);
-    mappingTemplateHeaderRow = detectedTemplateRow;
-    mappingPurchaseHeaderRow = 1;
-    fillRowSelectOptions($('mappingTemplateHeaderRowInput'), templateSheet.rowCount || 1, detectedTemplateRow);
-    fillRowSelectOptions($('mappingPurchaseHeaderRowInput'), purchaseSheet.rowCount || 1, 1);
-    setHeaderRowUi(detectedTemplateRow, 1);
+    const templateRowSelect = $('mappingTemplateHeaderRowInput');
+    const purchaseRowSelect = $('mappingPurchaseHeaderRowInput');
+
+    let templateHeaders = [];
+    let purchaseHeaders = [];
+    let detectedTemplateRow = 1;
+    let detectedPurchaseRow = 1;
+
+    mappingTemplateSheet = null;
+    mappingPurchaseSheet = null;
+
+    if (templateType === 'xlsx') {
+      const templateSheet = await loadXlsxSheetFromDownload(`/api/templates/${encodeURIComponent(templateId)}/download`);
+      mappingTemplateSheet = templateSheet;
+      detectedTemplateRow = detectTemplateHeaderRow(templateSheet);
+      templateHeaders = extractHeadersFromRow(templateSheet, detectedTemplateRow);
+      fillRowSelectOptions(templateRowSelect, templateSheet.rowCount || 1, detectedTemplateRow);
+      if (templateRowSelect) templateRowSelect.disabled = false;
+    } else if (templateType === 'doc' || templateType === 'docx') {
+      const { data } = await apiJson(`/api/templates/${encodeURIComponent(templateId)}/headers`);
+      templateHeaders = data?.headers ?? [];
+      detectedTemplateRow = 1;
+      fillRowSelectOptions(templateRowSelect, 1, 1);
+      if (templateRowSelect) templateRowSelect.disabled = true;
+    } else {
+      throw new Error('合同模板仅支持 xlsx/doc/docx 建立映射');
+    }
+
+    if (purchaseType === 'xlsx') {
+      const purchaseSheet = await loadXlsxSheetFromDownload(`/api/purchase-orders/${encodeURIComponent(purchaseId)}/download`);
+      mappingPurchaseSheet = purchaseSheet;
+      detectedPurchaseRow = 1;
+      purchaseHeaders = extractHeadersFromRow(purchaseSheet, 1);
+      fillRowSelectOptions(purchaseRowSelect, purchaseSheet.rowCount || 1, 1);
+      if (purchaseRowSelect) purchaseRowSelect.disabled = false;
+    } else if (purchaseType === 'doc' || purchaseType === 'docx') {
+      const { data } = await apiJson(`/api/purchase-orders/${encodeURIComponent(purchaseId)}/headers`);
+      purchaseHeaders = data?.headers ?? [];
+      detectedPurchaseRow = 1;
+      fillRowSelectOptions(purchaseRowSelect, 1, 1);
+      if (purchaseRowSelect) purchaseRowSelect.disabled = true;
+    } else {
+      throw new Error('订购单仅支持 xlsx/doc/docx 建立映射');
+    }
 
     updateDefaultMappingName(false);
     mappingRules = [];
-    const autoCount = applyHeaderRowSelection({ keepExistingRules: false });
+    const autoCount = setMappingHeaders({
+      templateHeaders,
+      purchaseHeaders,
+      templateRow: detectedTemplateRow,
+      purchaseRow: detectedPurchaseRow,
+      keepExistingRules: false
+    });
     setStatus(status, `解析完成，已自动匹配 ${autoCount} 条规则`);
   } catch (e) {
-    mappingTemplateHeaders = [];
-    mappingPurchaseHeaders = [];
-    mappingTemplateHeaderRow = null;
-    mappingPurchaseHeaderRow = null;
-    mappingRules = [];
-    mappingTemplateSheet = null;
-    mappingPurchaseSheet = null;
-    setHeaderRowUi(null, null);
-    const tbox = $('templateHeadersBox');
-    const pbox = $('purchaseHeadersBox');
-    if (tbox) tbox.innerHTML = '';
-    if (pbox) pbox.innerHTML = '';
-    renderMappingRulesTable();
+    resetMappingParsedState();
     setStatus(status, e.message || '解析失败', 'error');
   }
 }
@@ -814,14 +913,16 @@ async function init() {
     const fileInput = $('templateFile');
     const file = fileInput.files && fileInput.files[0];
     if (!file) return;
-    if (!String(input.value || '').trim()) input.value = stripFileExtension(file.name);
+    input.value = stripFileExtension(file.name);
+    input.dataset.autoFilled = '1';
   });
   $('purchaseFile').addEventListener('change', () => {
     const input = $('purchaseName');
     const fileInput = $('purchaseFile');
     const file = fileInput.files && fileInput.files[0];
     if (!file) return;
-    if (!String(input.value || '').trim()) input.value = stripFileExtension(file.name);
+    input.value = stripFileExtension(file.name);
+    input.dataset.autoFilled = '1';
   });
 
   $('templatesTbody').addEventListener('click', async (e) => {
@@ -840,6 +941,7 @@ async function init() {
       try {
         await apiJson(`/api/templates/${encodeURIComponent(id)}`, { method: 'DELETE' });
         await refreshTemplates();
+        await refreshMappings();
       } catch (err) {
         setStatus($('templateStatus'), err.message || '删除失败', 'error');
       }
@@ -862,6 +964,8 @@ async function init() {
       try {
         await apiJson(`/api/purchase-orders/${encodeURIComponent(id)}`, { method: 'DELETE' });
         await refreshPurchaseOrders();
+        fillSelectOptions($('mappingPurchaseSelect'), purchaseOrdersCache, '请选择订购单');
+        await refreshMappings();
       } catch (err) {
         setStatus($('purchaseStatus'), err.message || '删除失败', 'error');
       }
