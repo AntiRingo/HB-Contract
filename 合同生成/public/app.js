@@ -328,7 +328,11 @@ async function applyDocxEditsToArrayBuffer(originalArrayBuffer, container) {
   }
 
   zip.file("word/document.xml", documentXml);
-  const out = await zip.generateAsync({ type: "arraybuffer" });
+  const out = await zip.generateAsync({
+    type: "arraybuffer",
+    compression: "DEFLATE",
+    compressionOptions: { level: 6 },
+  });
   return out;
 }
 
@@ -1162,7 +1166,7 @@ function getRowNonEmptyMinMax(worksheet, rowIndex1) {
   });
   if (!Number.isFinite(minCol) || !Number.isFinite(maxCol)) return null;
   return { minCol, maxCol };
-}
+}          
 
 function adjustFormula(formula, oldRow, newRow) {
   if (!formula || typeof formula !== "string") return formula;
@@ -1220,7 +1224,7 @@ function adjustFormula(formula, oldRow, newRow) {
   return out;
 }
 
-function adjustFormulaByRowThreshold(formula, thresholdRow1, deltaRows) {
+function adjustFormulaByRowThreshold(formula, thresholdRow1, deltaRows, mergeEndRowMap) {
   if (!formula || typeof formula !== "string") return formula;
   if (!deltaRows) return formula;
   const threshold = Number(thresholdRow1);
@@ -1260,10 +1264,28 @@ function adjustFormulaByRowThreshold(formula, thresholdRow1, deltaRows) {
     const insertAt = threshold;
     const delta = deltaRows;
 
-    if (s.rowAbs !== "$" && sRow >= insertAt) s.row = Math.max(1, sRow + delta);
+    // 判定是否为区域引用（如 A11:A13），若是区域引用且插入点在起始行，则扩展起始行
+    const isRange = (s.col !== e.col || sRow !== eRow);
+
+    if (s.rowAbs !== "$") {
+      if (sRow > insertAt || (sRow === insertAt && !isRange)) {
+        s.row = Math.max(1, sRow + delta);
+      }
+    }
+
     if (e.rowAbs !== "$") {
-      if (eRow >= insertAt) e.row = Math.max(1, eRow + delta);
-      else if (eRow === insertAt - 1 && sRow < insertAt) e.row = Math.max(1, eRow + delta);
+      if (eRow >= insertAt) {
+        e.row = Math.max(1, eRow + delta);
+      } else {
+        // 核心修正：如果结束行虽然在插入点之前，但它是一个合并单元格的一部分，
+        // 且该合并区域的物理结束位置正好在插入点之前（insertAt - 1），则认为该范围需要扩张。
+        const c = typeof decodeCol === "function" ? decodeCol(e.col) : 0;
+        const effectiveEnd = (mergeEndRowMap && c) ? (mergeEndRowMap.get(`${eRow},${c}`) || eRow) : eRow;
+        
+        if (effectiveEnd === insertAt - 1 && sRow < insertAt) {
+          e.row = Math.max(1, eRow + delta);
+        }
+      }
     }
 
     return `${encodeCellRef(s)}:${encodeCellRef(e)}`;
@@ -1366,6 +1388,21 @@ function updateWorksheetFormulasAfterRowChange(worksheet, thresholdRow1, deltaRo
   const skipStart = Number(skipStartRow1);
   const skipEnd = Number.isFinite(skipStart) && skipRowCount ? skipStart + skipRowCount - 1 : null;
 
+  // 预先构建合并单元格结束行映射，用于公式范围扩张判断
+  const mergeEndRowMap = new Map();
+  const merges = worksheet?.model?.merges;
+  if (Array.isArray(merges)) {
+    for (const rangeStr of merges) {
+      const decoded = decodeRangeAddr(rangeStr);
+      if (!decoded) continue;
+      for (let r = decoded.s.r; r <= decoded.e.r; r++) {
+        for (let c = decoded.s.c; c <= decoded.e.c; c++) {
+          mergeEndRowMap.set(`${r},${c}`, decoded.e.r);
+        }
+      }
+    }
+  }
+
   const getCellFormulaText = (ws, r1, c1, v) => {
     if (!v || typeof v !== "object") return "";
     if (v.formula) return String(v.formula);
@@ -1391,7 +1428,7 @@ function updateWorksheetFormulasAfterRowChange(worksheet, thresholdRow1, deltaRo
       if (!v || typeof v !== "object" || (!v.formula && !v.sharedFormula)) continue;
       const baseFormula = getCellFormulaText(worksheet, r, c, v);
       if (!baseFormula) continue;
-      const nextFormula = adjustFormulaByRowThreshold(baseFormula, thresholdRow1, deltaRows);
+      const nextFormula = adjustFormulaByRowThreshold(baseFormula, thresholdRow1, deltaRows, mergeEndRowMap);
       if (nextFormula === baseFormula) continue;
       const nextValue = { ...v, formula: nextFormula };
       if (nextValue.sharedFormula !== undefined) delete nextValue.sharedFormula;
@@ -1498,98 +1535,11 @@ async function insertPurchaseRowsIntoTemplate({
 
   const insertAtRow1 = getInsertAtRow1();
 
-  const styleSourceRowAtInsert = templateWs.getRow(insertAtRow1);
-  const styleSourceRowAtBase = templateWs.getRow(baseDetailRow1);
-  const styleByCol = new Map();
-  const formulaByCol = new Map();
-  let fallbackStyle = null;
-  
-  for (let c = originCol; c <= maxAssignedCol; c += 1) {
-    const cellAtInsert = styleSourceRowAtInsert.getCell(c);
-    const cellAtBase = styleSourceRowAtBase.getCell(c);
-    
-    // 选取样式的优先级：插入点行 > 标题下第一行
-    let pickedStyleCell = (cellAtInsert?.style && Object.keys(cellAtInsert.style).length > 0) ? cellAtInsert : cellAtBase;
-    
-    if (pickedStyleCell?.style && Object.keys(pickedStyleCell.style).length > 0) {
-      const s = deepClone(pickedStyleCell.style);
-      
-      // 优化边框逻辑：如果该列在明细区有边框，确保新生成的行拥有完整的上下边框
-      // 避免因为模板行只设置了上边框或下边框，导致新行之间没有分割线
-      if (s.border) {
-        const b = s.border;
-        if (b.top && !b.bottom) b.bottom = deepClone(b.top);
-        if (b.bottom && !b.top) b.top = deepClone(b.bottom);
-      }
-      
-      styleByCol.set(c, s);
-      if (!fallbackStyle) fallbackStyle = s;
-    }
-    // ... 检查并记录公式 ...
-    const findFormulaTemplateInCol = () => {
-      const maxRow = Math.max(templateWs.rowCount || 0, templateWs.actualRowCount || 0) || baseDetailRow1;
-      const end = Math.min(maxRow, baseDetailRow1 + 60);
-      const preferred = [
-        { row1: insertAtRow1, cell: cellAtInsert },
-        { row1: baseDetailRow1, cell: cellAtBase },
-      ];
-      const tryCell = (row1, cell) => {
-        const v = cell?.value;
-        if (!v || typeof v !== "object") return null;
-        if (v.formula) return { formula: String(v.formula), sourceRow1: row1 };
-        if (!v.sharedFormula) return null;
-        const masterAddr = String(v.sharedFormula);
-        const masterPos = decodeCellAddr(masterAddr);
-        const masterCell = templateWs.getCell(masterAddr);
-        const masterVal = masterCell?.value;
-        const masterFormula =
-          masterVal && typeof masterVal === "object" && masterVal.formula ? String(masterVal.formula) : "";
-        if (!masterFormula) return null;
-        if (!masterPos) return { formula: masterFormula, sourceRow1: row1 };
-        const deltaR = row1 - masterPos.r;
-        const deltaC = c - masterPos.c;
-        return { formula: adjustFormulaByOffset(masterFormula, deltaR, deltaC), sourceRow1: row1 };
-      };
-
-      for (const p of preferred) {
-        const hit = tryCell(p.row1, p.cell);
-        if (hit) return hit;
-      }
-      for (let r = baseDetailRow1; r <= end; r += 1) {
-        const cell = templateWs.getRow(r).getCell(c);
-        const hit = tryCell(r, cell);
-        if (hit) return hit;
-      }
-      return null;
-    };
-
-    const tpl = findFormulaTemplateInCol();
-    if (tpl) formulaByCol.set(c, tpl);
-  }
-  const rowHeight = styleSourceRowAtInsert.height ?? styleSourceRowAtBase.height;
-
-  const insertRowValuesList = [];
-  const maxPurchaseRow = Math.max(purchaseWs.rowCount || 0, purchaseWs.actualRowCount || 0);
-  for (let r = purchaseHeaderRow.rowIndex + 1; r <= maxPurchaseRow; r += 1) {
-    const row = purchaseWs.getRow(r);
-    const values = new Array(maxAssignedCol).fill(null);
-    let any = false;
-    for (const pair of mappingPairs) {
-      const cell = row.getCell(pair.purchaseCol);
-      const text = getCellText(cell);
-      if (normalizeText(text)) any = true;
-      values[pair.contractCol - 1] = cell.value ?? null;
-    }
-    if (any) insertRowValuesList.push(values);
-  }
-  if (insertRowValuesList.length === 0) throw new Error("订购单没有可插入的数据行");
-
-  const originalMerges = getWorksheetMergeRanges(templateWs);
-  const deltaRows = insertRowValuesList.length;
-
+  // --- 新增：提前计算占位行，用于后续样式/公式提取的范围限制 ---
   let blankTemplateRowsCount = 0;
   const maxSearchRows = 200;
   const footerTextRe = /(合计|小计|总计|金额合计|总价|备注|说明|条款|结算|税)/;
+  
   const rowLooksLikePlaceholder = (rowIndex1) => {
     const row = templateWs.getRow(rowIndex1);
     let hasFooterText = false;
@@ -1634,6 +1584,102 @@ async function insertPurchaseRowsIntoTemplate({
     if (!rowLooksLikePlaceholder(rowIndex1)) break;
     blankTemplateRowsCount += 1;
   }
+  // --- 结束：提前计算占位行 ---
+
+  const styleSourceRowAtInsert = templateWs.getRow(insertAtRow1);
+  const styleSourceRowAtBase = templateWs.getRow(baseDetailRow1);
+  const styleByCol = new Map();
+  const formulaByCol = new Map();
+  let fallbackStyle = null;
+  
+  for (let c = originCol; c <= maxAssignedCol; c += 1) {
+    const cellAtInsert = styleSourceRowAtInsert.getCell(c);
+    const cellAtBase = styleSourceRowAtBase.getCell(c);
+    
+    // 选取样式的优先级：插入点行 > 标题下第一行
+    let pickedStyleCell = (cellAtInsert?.style && Object.keys(cellAtInsert.style).length > 0) ? cellAtInsert : cellAtBase;
+    
+    if (pickedStyleCell?.style && Object.keys(pickedStyleCell.style).length > 0) {
+      const s = deepClone(pickedStyleCell.style);
+      
+      // 优化边框逻辑：如果该列在明细区有边框，确保新生成的行拥有完整的上下边框
+      // 避免因为模板行只设置了上边框或下边框，导致新行之间没有分割线
+      if (s.border) {
+        const b = s.border;
+        if (b.top && !b.bottom) b.bottom = deepClone(b.top);
+        if (b.bottom && !b.top) b.top = deepClone(b.bottom);
+      }
+      
+      styleByCol.set(c, s);
+      if (!fallbackStyle) fallbackStyle = s;
+    }
+    // ... 检查并记录公式 ...
+    const findFormulaTemplateInCol = () => {
+      const maxRow = Math.max(templateWs.rowCount || 0, templateWs.actualRowCount || 0) || baseDetailRow1;
+      // 修正：公式扫描范围仅限于已识别的占位行或明细行，严禁扫描到页脚汇总行
+      const placeholderEndRow = insertAtRow1 + Math.max(0, blankTemplateRowsCount - 1);
+      const scanEnd = Math.max(baseDetailRow1, placeholderEndRow);
+      
+      const preferred = [
+        { row1: insertAtRow1, cell: cellAtInsert },
+        { row1: baseDetailRow1, cell: cellAtBase },
+      ];
+      const tryCell = (row1, cell) => {
+        const v = cell?.value;
+        if (!v || typeof v !== "object") return null;
+        if (v.formula) return { formula: String(v.formula), sourceRow1: row1 };
+        if (!v.sharedFormula) return null;
+        const masterAddr = String(v.sharedFormula);
+        const masterPos = decodeCellAddr(masterAddr);
+        const masterCell = templateWs.getCell(masterAddr);
+        const masterVal = masterCell?.value;
+        const masterFormula =
+          masterVal && typeof masterVal === "object" && masterVal.formula ? String(masterVal.formula) : "";
+        if (!masterFormula) return null;
+        if (!masterPos) return { formula: masterFormula, sourceRow1: row1 };
+        const deltaR = row1 - masterPos.r;
+        const deltaC = c - masterPos.c;
+        return { formula: adjustFormulaByOffset(masterFormula, deltaR, deltaC), sourceRow1: row1 };
+      };
+
+      for (const p of preferred) {
+        // 只有当行属于占位行或基础行时才尝试
+        if (p.row1 <= scanEnd || p.row1 === baseDetailRow1) {
+          const hit = tryCell(p.row1, p.cell);
+          if (hit) return hit;
+        }
+      }
+      for (let r = baseDetailRow1; r <= scanEnd; r += 1) {
+        const cell = templateWs.getRow(r).getCell(c);
+        const hit = tryCell(r, cell);
+        if (hit) return hit;
+      }
+      return null;
+    };
+
+    const tpl = findFormulaTemplateInCol();
+    if (tpl) formulaByCol.set(c, tpl);
+  }
+  const rowHeight = styleSourceRowAtInsert.height ?? styleSourceRowAtBase.height;
+
+  const insertRowValuesList = [];
+  const maxPurchaseRow = Math.max(purchaseWs.rowCount || 0, purchaseWs.actualRowCount || 0);
+  for (let r = purchaseHeaderRow.rowIndex + 1; r <= maxPurchaseRow; r += 1) {
+    const row = purchaseWs.getRow(r);
+    const values = new Array(maxAssignedCol).fill(null);
+    let any = false;
+    for (const pair of mappingPairs) {
+      const cell = row.getCell(pair.purchaseCol);
+      const text = getCellText(cell);
+      if (normalizeText(text)) any = true;
+      values[pair.contractCol - 1] = cell.value ?? null;
+    }
+    if (any) insertRowValuesList.push(values);
+  }
+  if (insertRowValuesList.length === 0) throw new Error("订购单没有可插入的数据行");
+
+  const originalMerges = getWorksheetMergeRanges(templateWs);
+  const deltaRows = insertRowValuesList.length;
 
   let netDelta = 0;
   let thresholdRow1 = insertAtRow1;

@@ -36,6 +36,7 @@ async function resolveContractsConfig() {
         id: pickColumn(fields, ['id', 'Id', 'ID']),
         name: pickColumn(fields, ['name', 'Name', '标题', '合同名称']),
         filePath: pickColumn(fields, ['file_path', 'File_path', 'filepath', 'path', '文件路径']),
+        fileType: pickColumn(fields, ['file_type', 'File_type', 'type', '文件类型']),
         createdAt: pickColumn(fields, ['created_at', 'Created_at', 'create_time', '创建时间']),
     };
     if (!columns.id || !columns.name || !columns.filePath) {
@@ -94,6 +95,7 @@ router.get('/', async (req, res) => {
             `${quoteIdent(columns.id)} AS id`,
             `${quoteIdent(columns.name)} AS name`,
             `${quoteIdent(columns.filePath)} AS file_path`,
+            columns.fileType ? `${quoteIdent(columns.fileType)} AS file_type` : `NULL AS file_type`,
             columns.createdAt ? `${quoteIdent(columns.createdAt)} AS created_at` : `NULL AS created_at`,
         ].join(', ');
         const [rows] = await pool.query(
@@ -174,8 +176,10 @@ router.post(
     async (req, res) => {
         try {
             const nameParam = req.query.name || req.body?.name; // 兼容意外情况
+            const extParam = req.query.ext || 'xlsx';
             const baseName = sanitizeFilename(nameParam);
-            const fileName = baseName.endsWith('.xlsx') ? baseName : `${baseName}.xlsx`;
+            const extension = extParam.startsWith('.') ? extParam : `.${extParam}`;
+            const fileName = baseName.endsWith(extension) ? baseName : `${baseName}${extension}`;
 
             const buffer = Buffer.isBuffer(req.body)
                 ? req.body
@@ -195,8 +199,14 @@ router.post(
             const { table, columns } = config;
             const fields = [columns.name, columns.filePath];
             const values = [baseName, relPath];
+
+            if (columns.fileType) {
+                fields.push(columns.fileType);
+                values.push(extParam.replace(/^\./, ''));
+            }
+
             let sql = `INSERT INTO ${quoteIdent(table)} (${fields.map(quoteIdent).join(', ')}`;
-            let placeholders = '?, ?';
+            let placeholders = fields.map(() => '?').join(', ');
             if (columns.createdAt) {
                 sql += `, ${quoteIdent(columns.createdAt)}`;
                 placeholders += ', NOW()';

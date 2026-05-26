@@ -201,16 +201,6 @@
   min-height: 18px;
 }
 
-.docxText {
-  margin: 0 0 8px 0;
-  color: #0f172a;
-  font-size: 12px;
-  line-height: 1.8;
-  white-space: pre-wrap;
-  word-break: break-word;
-  overflow-wrap: anywhere;
-}
-
 .actions {
   display: flex;
   align-items: center;
@@ -367,23 +357,6 @@
   overflow: auto;
 }
 
-#previewOverlay .modalBody {
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-
-#previewBody {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow: auto;
-}
-
-#previewOverlay .previewBox {
-  overflow: visible;
-}
-
 .previewBox {
   border: 1px solid #e2e8f0;
   border-radius: 12px;
@@ -402,10 +375,8 @@
   border: 1px solid #e2e8f0;
   padding: 6px 8px;
   font-size: 12px;
-  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
-  overflow-wrap: anywhere;
   max-width: 280px;
 }
 
@@ -415,6 +386,19 @@
   background: #f1f5f9;
   z-index: 1;
   font-weight: 600;
+}
+
+.docxText {
+  margin: 10px 0;
+  line-height: 1.8;
+  color: #334155;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.docxPreview {
+  padding: 10px;
 }
 
 .previewFrame {

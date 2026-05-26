@@ -95,6 +95,7 @@ function openPreviewShell(title, metaText) {
 
 function openMapping() {
   $('mappingOverlay').classList.remove('hidden');
+  updateDefaultMappingName(false);
 }
 
 function closeMapping() {
@@ -115,18 +116,6 @@ async function renderExcelPreview(arrayBuffer) {
   if (!window.ExcelJS) {
     return '<div class="meta">Excel 预览组件未加载，请刷新页面重试。</div>';
   }
-
-  const columnToLetters = (n) => {
-    let x = Number(n) || 0;
-    if (x < 1) return '';
-    let s = '';
-    while (x > 0) {
-      x -= 1;
-      s = String.fromCharCode(65 + (x % 26)) + s;
-      x = Math.floor(x / 26);
-    }
-    return s;
-  };
 
   const workbook = new window.ExcelJS.Workbook();
   try {
@@ -168,7 +157,7 @@ async function renderExcelPreview(arrayBuffer) {
 
   let html = '<div class="previewBox"><table class="previewTable"><thead><tr><th></th>';
   for (let c = 1; c <= maxCols; c++) {
-    html += `<th>${escapeHtml(columnToLetters(c))}</th>`;
+    html += `<th>${escapeHtml(String(c))}</th>`;
   }
   html += '</tr></thead><tbody>';
   for (let r = 1; r <= maxRows; r++) {
@@ -338,10 +327,12 @@ function updateDefaultMappingName(force) {
   if (!next) return;
 
   const current = String(input.value || '').trim();
-  const shouldUpdate = force || mappingNameIsAuto || current === lastAutoMappingName || !current;
+  const autoFilled = input.dataset.autoFilled === '1';
+  const shouldUpdate = force || autoFilled || mappingNameIsAuto || current === lastAutoMappingName || !current;
   if (!shouldUpdate) return;
 
   input.value = next;
+  input.dataset.autoFilled = '1';
   mappingNameIsAuto = true;
   lastAutoMappingName = next;
 }
@@ -403,26 +394,24 @@ function mergeAutoMatchedRules(existingRules, templateHeaders, purchaseHeaders) 
 }
 
 function setMappingHeaders({ templateHeaders, purchaseHeaders, templateRow, purchaseRow, keepExistingRules }) {
-  const t = Array.isArray(templateHeaders) ? templateHeaders : [];
-  const p = Array.isArray(purchaseHeaders) ? purchaseHeaders : [];
-  if (!t.length) throw new Error('合同模板标题行为空');
-  if (!p.length) throw new Error('订购单标题行为空');
+  if (!templateHeaders || !templateHeaders.length) throw new Error('合同模板标题行为空');
+  if (!purchaseHeaders || !purchaseHeaders.length) throw new Error('订购单标题行为空');
 
-  mappingTemplateHeaderRow = templateRow ?? 1;
-  mappingPurchaseHeaderRow = purchaseRow ?? 1;
-  mappingTemplateHeaders = t;
-  mappingPurchaseHeaders = p;
+  mappingTemplateHeaderRow = templateRow;
+  mappingPurchaseHeaderRow = purchaseRow;
+  mappingTemplateHeaders = templateHeaders;
+  mappingPurchaseHeaders = purchaseHeaders;
 
-  setHeaderRowUi(mappingTemplateHeaderRow, mappingPurchaseHeaderRow);
+  setHeaderRowUi(templateRow, purchaseRow);
   renderChips($('templateHeadersBox'), mappingTemplateHeaders);
   renderChips($('purchaseHeadersBox'), mappingPurchaseHeaders);
 
   mappingRules = mergeAutoMatchedRules(keepExistingRules ? mappingRules : [], mappingTemplateHeaders, mappingPurchaseHeaders);
   renderMappingRulesTable();
-  return mappingRules.length ? mappingRules.length - 1 : 0;
+  return mappingRules.length;
 }
 
-function applyHeaderRowSelection({ keepExistingRules }) {
+async function applyHeaderRowSelection({ keepExistingRules }) {
   const templateInput = $('mappingTemplateHeaderRowInput');
   const purchaseInput = $('mappingPurchaseHeaderRowInput');
 
@@ -436,15 +425,23 @@ function applyHeaderRowSelection({ keepExistingRules }) {
     const templateMax = mappingTemplateSheet.rowCount || templateRow;
     if (templateRow > templateMax) throw new Error(`合同模板标题行超出范围（最大 ${templateMax}）`);
     newTemplateHeaders = extractHeadersFromRow(mappingTemplateSheet, templateRow);
+  } else if ($('mappingTemplateSelect').value) {
+    // 可能是 doc/docx，从后端获取
+    const templateId = $('mappingTemplateSelect').value;
+    const { data } = await apiJson(`/api/templates/${encodeURIComponent(templateId)}/headers?row=${templateRow}`);
+    newTemplateHeaders = data?.headers ?? [];
   }
+
   if (mappingPurchaseSheet) {
     const purchaseMax = mappingPurchaseSheet.rowCount || purchaseRow;
     if (purchaseRow > purchaseMax) throw new Error(`订购单标题行超出范围（最大 ${purchaseMax}）`);
     newPurchaseHeaders = extractHeadersFromRow(mappingPurchaseSheet, purchaseRow);
+  } else if ($('mappingPurchaseSelect').value) {
+    // 可能是 doc/docx，从后端获取
+    const purchaseId = $('mappingPurchaseSelect').value;
+    const { data } = await apiJson(`/api/purchase-orders/${encodeURIComponent(purchaseId)}/headers?row=${purchaseRow}`);
+    newPurchaseHeaders = data?.headers ?? [];
   }
-
-  if (!newTemplateHeaders || !newTemplateHeaders.length) throw new Error('请先解析标题');
-  if (!newPurchaseHeaders || !newPurchaseHeaders.length) throw new Error('请先解析标题');
 
   return setMappingHeaders({
     templateHeaders: newTemplateHeaders,
@@ -466,14 +463,8 @@ function resetMappingParsedState() {
   setHeaderRowUi(null, null);
   const templateSelect = $('mappingTemplateHeaderRowInput');
   const purchaseSelect = $('mappingPurchaseHeaderRowInput');
-  if (templateSelect) {
-    templateSelect.innerHTML = '';
-    templateSelect.disabled = false;
-  }
-  if (purchaseSelect) {
-    purchaseSelect.innerHTML = '';
-    purchaseSelect.disabled = false;
-  }
+  if (templateSelect) templateSelect.innerHTML = '';
+  if (purchaseSelect) purchaseSelect.innerHTML = '';
   const tbox = $('templateHeadersBox');
   const pbox = $('purchaseHeadersBox');
   if (tbox) tbox.innerHTML = '';
@@ -502,31 +493,27 @@ async function previewRecord(kind, row) {
 
     if (ext === 'docx') {
       const { data } = await apiJson(`/api/${kind}/${encodeURIComponent(id)}/preview`);
-      const blocks = data?.blocks || [];
-      const parts = [];
-      for (const b of blocks) {
-        if (b?.type === 'p') {
-          const t = String(b.text ?? '').trim();
-          if (!t) continue;
-          parts.push(`<div class="docxText">${escapeHtml(t)}</div>`);
-          continue;
+      if (data && data.blocks) {
+        let html = '<div class="docxPreview">';
+        for (const b of data.blocks) {
+          if (b.type === 'p') {
+            html += `<p class="docxText">${escapeHtml(b.text)}</p>`;
+          } else if (b.type === 'table') {
+            html += '<div class="previewBox"><table class="previewTable"><tbody>';
+            for (const row of b.rows) {
+              html += '<tr>';
+              for (const cell of row) {
+                html += `<td>${escapeHtml(cell)}</td>`;
+              }
+              html += '</tr>';
+            }
+            html += '</tbody></table></div>';
+          }
         }
-        if (b?.type === 'table' && Array.isArray(b.rows) && b.rows.length) {
-          const rows = b.rows;
-          const head = rows[0] || [];
-          const bodyRows = rows.slice(1);
-          const thead =
-            head.length > 0
-              ? `<thead><tr>${head.map((c) => `<th>${escapeHtml(String(c ?? ''))}</th>`).join('')}</tr></thead>`
-              : '';
-          const tbody = `<tbody>${bodyRows
-            .map((r) => `<tr>${(r || []).map((c) => `<td>${escapeHtml(String(c ?? ''))}</td>`).join('')}</tr>`)
-            .join('')}</tbody>`;
-          parts.push(`<div class="previewBox"><table class="previewTable">${thead}${tbody}</table></div>`);
-        }
+        html += '</div>';
+        $('previewBody').innerHTML = html;
+        return;
       }
-      $('previewBody').innerHTML = parts.join('') || '<div class="meta">未解析到可预览内容</div>';
-      return;
     }
 
     currentPreviewUrl = URL.createObjectURL(blob);
@@ -754,9 +741,9 @@ async function parseMappingHeaders() {
     } else if (templateType === 'doc' || templateType === 'docx') {
       const { data } = await apiJson(`/api/templates/${encodeURIComponent(templateId)}/headers`);
       templateHeaders = data?.headers ?? [];
-      detectedTemplateRow = 1;
-      fillRowSelectOptions(templateRowSelect, 1, 1);
-      if (templateRowSelect) templateRowSelect.disabled = true;
+      detectedTemplateRow = data?.bestRow ?? 1;
+      fillRowSelectOptions(templateRowSelect, data?.rowCount || 1, detectedTemplateRow);
+      if (templateRowSelect) templateRowSelect.disabled = false;
     } else {
       throw new Error('合同模板仅支持 xlsx/doc/docx 建立映射');
     }
@@ -771,9 +758,9 @@ async function parseMappingHeaders() {
     } else if (purchaseType === 'doc' || purchaseType === 'docx') {
       const { data } = await apiJson(`/api/purchase-orders/${encodeURIComponent(purchaseId)}/headers`);
       purchaseHeaders = data?.headers ?? [];
-      detectedPurchaseRow = 1;
-      fillRowSelectOptions(purchaseRowSelect, 1, 1);
-      if (purchaseRowSelect) purchaseRowSelect.disabled = true;
+      detectedPurchaseRow = data?.bestRow ?? 1;
+      fillRowSelectOptions(purchaseRowSelect, data?.rowCount || 1, detectedPurchaseRow);
+      if (purchaseRowSelect) purchaseRowSelect.disabled = false;
     } else {
       throw new Error('订购单仅支持 xlsx/doc/docx 建立映射');
     }
@@ -856,6 +843,8 @@ async function handleUploadTemplate() {
     fd.append('file', file);
     await apiJson('/api/templates/upload', { method: 'POST', body: fd });
     setStatus(status, '上传成功');
+    $('templateName').value = '';
+    $('templateName').dataset.autoFilled = '1';
     fileInput.value = '';
     await refreshTemplates();
     fillSelectOptions($('mappingTemplateSelect'), templatesCache, '请选择合同模板');
@@ -885,6 +874,8 @@ async function handleUploadPurchase() {
     fd.append('file', file);
     await apiJson('/api/purchase-orders/upload', { method: 'POST', body: fd });
     setStatus(status, '上传成功');
+    $('purchaseName').value = '';
+    $('purchaseName').dataset.autoFilled = '1';
     fileInput.value = '';
     await refreshPurchaseOrders();
     fillSelectOptions($('mappingPurchaseSelect'), purchaseOrdersCache, '请选择订购单');
@@ -898,6 +889,21 @@ async function handleUploadPurchase() {
 async function init() {
   $('uploadTemplateBtn').addEventListener('click', handleUploadTemplate);
   $('uploadPurchaseBtn').addEventListener('click', handleUploadPurchase);
+  $('templateName').addEventListener('input', () => {
+    const input = $('templateName');
+    const v = String(input.value || '').trim();
+    input.dataset.autoFilled = v ? '0' : '1';
+  });
+  $('purchaseName').addEventListener('input', () => {
+    const input = $('purchaseName');
+    const v = String(input.value || '').trim();
+    input.dataset.autoFilled = v ? '0' : '1';
+  });
+  $('mappingName').addEventListener('input', () => {
+    const input = $('mappingName');
+    const v = String(input.value || '').trim();
+    input.dataset.autoFilled = v ? '0' : '1';
+  });
   $('mappingName').addEventListener('input', () => {
     const v = String($('mappingName').value || '').trim();
     if (!v) {
@@ -913,16 +919,22 @@ async function init() {
     const fileInput = $('templateFile');
     const file = fileInput.files && fileInput.files[0];
     if (!file) return;
-    input.value = stripFileExtension(file.name);
-    input.dataset.autoFilled = '1';
+    const shouldAutofill = input.dataset.autoFilled === '1' || !String(input.value || '').trim();
+    if (shouldAutofill) {
+      input.value = stripFileExtension(file.name);
+      input.dataset.autoFilled = '1';
+    }
   });
   $('purchaseFile').addEventListener('change', () => {
     const input = $('purchaseName');
     const fileInput = $('purchaseFile');
     const file = fileInput.files && fileInput.files[0];
     if (!file) return;
-    input.value = stripFileExtension(file.name);
-    input.dataset.autoFilled = '1';
+    const shouldAutofill = input.dataset.autoFilled === '1' || !String(input.value || '').trim();
+    if (shouldAutofill) {
+      input.value = stripFileExtension(file.name);
+      input.dataset.autoFilled = '1';
+    }
   });
 
   $('templatesTbody').addEventListener('click', async (e) => {
@@ -941,7 +953,6 @@ async function init() {
       try {
         await apiJson(`/api/templates/${encodeURIComponent(id)}`, { method: 'DELETE' });
         await refreshTemplates();
-        await refreshMappings();
       } catch (err) {
         setStatus($('templateStatus'), err.message || '删除失败', 'error');
       }
@@ -964,8 +975,6 @@ async function init() {
       try {
         await apiJson(`/api/purchase-orders/${encodeURIComponent(id)}`, { method: 'DELETE' });
         await refreshPurchaseOrders();
-        fillSelectOptions($('mappingPurchaseSelect'), purchaseOrdersCache, '请选择订购单');
-        await refreshMappings();
       } catch (err) {
         setStatus($('purchaseStatus'), err.message || '删除失败', 'error');
       }
@@ -1003,17 +1012,17 @@ async function init() {
     resetMappingParsedState();
   });
 
-  $('mappingTemplateHeaderRowInput').addEventListener('change', () => {
+  $('mappingTemplateHeaderRowInput').addEventListener('change', async () => {
     try {
-      const autoCount = applyHeaderRowSelection({ keepExistingRules: true });
+      const autoCount = await applyHeaderRowSelection({ keepExistingRules: true });
       setStatus($('mappingStatus'), `已应用标题行，自动匹配 ${autoCount} 条规则`);
     } catch (e) {
       setStatus($('mappingStatus'), e.message || '应用失败', 'error');
     }
   });
-  $('mappingPurchaseHeaderRowInput').addEventListener('change', () => {
+  $('mappingPurchaseHeaderRowInput').addEventListener('change', async () => {
     try {
-      const autoCount = applyHeaderRowSelection({ keepExistingRules: true });
+      const autoCount = await applyHeaderRowSelection({ keepExistingRules: true });
       setStatus($('mappingStatus'), `已应用标题行，自动匹配 ${autoCount} 条规则`);
     } catch (e) {
       setStatus($('mappingStatus'), e.message || '应用失败', 'error');
